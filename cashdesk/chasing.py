@@ -2,17 +2,28 @@
 
 Stages are 7, 14, 21 and 28 days overdue. The customer's oldest overdue
 invoice sets the stage and one draft lists all their overdue invoices. The
-chase state remembers the highest stage drafted per invoice, so a daily run
-only writes a draft when a new stage is reached. Past 30 days the customer
-gets no reminder: an internal escalation note goes to the reviewer instead.
+chase state remembers the highest stage drafted per invoice, so a run only
+writes a draft when a new stage is reached; a stage passed between two runs
+(weekly runs: day 27, then day 34) is not skipped, the highest stage reached
+is drafted. An invoice past 30 days that never had its stage-28 reminder (a
+backlog on the first run, or a catch-up) gets that customer reminder first;
+the internal escalation note follows once the stage-28 reminder exists and,
+if it was drafted past 30 days, a week has passed. Escalation is per invoice:
+an escalated invoice is left to the reviewer and drops out of reminders,
+while the customer's newer invoices are still chased on their own schedule.
+
+Wording is truthful about history: a draft refers to earlier reminders only
+when ``reminders_sent`` says one was really sent for one of its invoices.
 
 Holds: a dispute (a disputed invoice, a customer on hold, or a reply that
 reads as a dispute) holds the whole customer; a payment in review holds just
 the invoice it may cover; a refund request is a credit-note question that
-holds the invoice and suppresses its thank-you; void invoices are never
-chased; a customer without an e-mail (or, in English, without a contact
-name) gets no draft and is listed. Thank-you drafts follow applied payments,
-once per invoice.
+holds the invoice and suppresses its thank-you; an open credit note (a
+negative balance) holds that customer's reminders, so no reminder states a
+gross total that is not owed; void invoices are never chased; a customer
+without an e-mail gets no draft and is listed (no contact name is fine: the
+draft opens "Hello,"). Thank-you drafts follow applied payments, once per
+invoice.
 """
 
 from __future__ import annotations
@@ -28,8 +39,12 @@ from .render import DraftLine, RenderContext, render_draft
 
 STAGES = ((7, "stage07"), (14, "stage14"), (21, "stage21"), (28, "stage28"))
 ESCALATE_AFTER = 30
+# A stage-28 reminder drafted when the invoice was already past 30 days gets
+# this long before the escalation note follows it.
+ESCALATION_WAIT = 7
 RANK = {"stage07": 1, "stage14": 2, "stage21": 3, "stage28": 4, "escalation": 5}
-HOLD_REASONS = ("dispute", "on_hold", "credit_note", "payment_in_review", "no_email", "no_contact_name", "no_customer")
+HOLD_REASONS = ("dispute", "on_hold", "credit_note", "payment_in_review", "no_email", "no_contact_name", "no_customer",
+                "promise", "not_in_export", "small_balance")
 
 # Reply classes, checked in this order: an auto-reply is never a promise, a
 # dispute wins over anything else in the same mail, "paid" beats "promise".
@@ -68,14 +83,27 @@ class ChaseState:
     drafted: dict[str, str] = field(default_factory=dict)
     thanked: set[str] = field(default_factory=set)
 
-    def rank(self, number: str) -> int:
-        return RANK.get(self.drafted.get(number, ""), 0)
+    def stage_of(self, number: str) -> str:
+        """The stage without its date: ``stage28@2026-11-10`` reads ``stage28``."""
+        return self.drafted.get(number, "").partition("@")[0]
 
-    def record(self, number: str, stage: str) -> None:
+    def rank(self, number: str) -> int:
+        return RANK.get(self.stage_of(number), 0)
+
+    def late_since(self, number: str) -> dt.date | None:
+        """The day a stage-28 reminder was drafted past 30 days (``stage28@<date>``), else None."""
+        _, _, since = self.drafted.get(number, "").partition("@")
+        try:
+            return dt.date.fromisoformat(since) if since else None
+        except ValueError:
+            return None
+
+    def record(self, number: str, stage: str, on: dt.date | None = None) -> None:
+        """Remember ``stage`` when it is higher than what is there; ``on`` dates a late stage-28 reminder."""
         if stage not in RANK:
             raise ValueError(f"unknown stage {stage!r}; thank-yous go through record_thanks")
-        if RANK[stage] >= self.rank(number):
-            self.drafted[number] = stage
+        if RANK[stage] > self.rank(number):
+            self.drafted[number] = f"{stage}@{on.isoformat()}" if on is not None else stage
 
     @staticmethod
     def thanks_key(number: str, payment_id: str) -> str:
@@ -98,7 +126,7 @@ class ChaseState:
         if not (text or "").strip():
             return cls()
         data = json.loads(text)
-        drafted = {str(k): str(v) for k, v in dict(data.get("drafted", {})).items() if str(v) in RANK}
+        drafted = {str(k): str(v) for k, v in dict(data.get("drafted", {})).items() if str(v).partition("@")[0] in RANK}
         return cls(drafted, {str(k) for k in data.get("thanked", [])})
 
 
@@ -156,11 +184,23 @@ def _customers(customers: Mapping[str, Customer] | Iterable[Customer]) -> dict[s
 
 
 def _contact_problem(customer: Customer) -> str | None:
+    """Only a missing e-mail stops a draft; without a contact name it opens "Hello," / "Dobrý den,"."""
     if not customer.email:
         return "no_email"
-    if customer.language == "en" and not customer.first_name:
-        return "no_contact_name"
     return None
+
+
+def _is_open_credit(inv: Invoice) -> bool:
+    """An open credit note: a negative balance the customer can still set off."""
+    return inv.balance < 0 and inv.status in ("open", "disputed")
+
+
+def _may_escalate(state: ChaseState, number: str, as_of: dt.date) -> bool:
+    """Past 30 days an invoice is escalated once its stage-28 reminder exists (a week after it, when that was drafted late)."""
+    if state.rank(number) < RANK["stage28"]:
+        return False
+    since = state.late_since(number)
+    return since is None or (as_of - since).days >= ESCALATION_WAIT
 
 
 def _line(inv: Invoice, days: int, amount=None) -> DraftLine:
@@ -179,6 +219,7 @@ def plan_followups(
     holds: Mapping[str, str] | None = None,
     replies: Iterable[Reply] = (),
     created_at: dt.datetime | None = None,
+    reminders_sent: Mapping[str, int] | Iterable[str] = (),
 ) -> FollowupPlan:
     """Decide today's drafts. Pure: returns a plan with an updated copy of ``state``.
 
@@ -186,6 +227,11 @@ def plan_followups(
     invoices under a credit-note question (held, no thank-you); ``holds`` maps
     invoices to a payment-in-review reason; ``replies`` are classified and a
     dispute holds its customer. ``sender`` signs every draft.
+
+    ``reminders_sent`` says which invoices already had a customer reminder
+    really sent (invoice number -> how many, or just the numbers for one
+    each). Only then may a draft refer to earlier reminders; the default
+    (nothing sent) keeps every draft a first contact that claims no history.
     """
     if not (sender or "").strip():
         raise ValueError("sender is required: every draft is signed by the business that issued the invoices")
@@ -199,6 +245,10 @@ def plan_followups(
     credit: dict[str, str] = dict(credit_notes) if isinstance(credit_notes, Mapping) else {str(n): "credit-note question" for n in credit_notes}
     review_holds = dict(holds or {})
     stamp = created_at or dt.datetime.now(dt.timezone.utc)
+    if isinstance(reminders_sent, Mapping):
+        sent_counts = {str(k): int(v) for k, v in reminders_sent.items()}
+    else:
+        sent_counts = {str(n): 1 for n in reminders_sent}
 
     customer_hold: dict[str, tuple[str, str]] = {}
     for c in cust_map.values():
@@ -207,6 +257,10 @@ def plan_followups(
     for inv in inv_map.values():
         if inv.is_disputed and inv.balance > 0:
             customer_hold.setdefault(inv.customer_id, ("dispute", f"{inv.number} is disputed"))
+    for inv in sorted(inv_map.values(), key=lambda i: i.number):
+        if _is_open_credit(inv):
+            customer_hold.setdefault(inv.customer_id, ("credit_note", f"open credit note {inv.number}: a reminder would state a gross total that is not owed. "
+                                                       "Set the credit note off against an invoice in the accounting system and re-import, then draft again"))
     classified: list[tuple[Reply, str]] = []
     for reply in replies:
         if reply.date > as_of:
@@ -241,6 +295,9 @@ def plan_followups(
         if inv.number in credit:
             hold(cid, [inv.number], "credit_note", credit[inv.number])
             continue
+        if _is_open_credit(inv) and cid in customer_hold:
+            hold(cid, [inv.number], *customer_hold[cid])
+            continue
         if not inv.is_open:
             continue
         days = inv.days_overdue(as_of)
@@ -248,7 +305,13 @@ def plan_followups(
             hold(cid, [inv.number], *customer_hold[cid])
             continue
         if inv.number in review_holds:
-            hold(cid, [inv.number], "payment_in_review", review_holds[inv.number])
+            why = review_holds[inv.number]
+            # a hold is "reason: detail" when the plugin layer names its own reason (promise, not_in_export, ...)
+            code, _, rest = str(why).partition(": ")
+            if code in HOLD_REASONS and rest:
+                hold(cid, [inv.number], code, rest)
+            else:
+                hold(cid, [inv.number], "payment_in_review", why)
             continue
         if days < 1:
             not_due.append(inv.number)
@@ -265,33 +328,37 @@ def plan_followups(
         if customer is None:
             hold(cid, numbers, "no_customer", "no customer record for this id")
             continue
-        over = [i for i, d in items if d > ESCALATE_AFTER]
-        if over:
-            if all(new_state.rank(i.number) >= RANK["escalation"] for i in over):
-                already.append((cid, "escalation"))
-                continue
-            context = RenderContext(customer, tuple(_line(i, d) for i, d in items), sender, as_of, {n: s for n, s in new_state.drafted.items() if n in numbers}, stamp)
+        active = [(i, d) for i, d in items if new_state.rank(i.number) < RANK["escalation"]]
+        parked = len(active) < len(items)
+        escalate = [(i, d) for i, d in active if d > ESCALATE_AFTER and _may_escalate(new_state, i.number, as_of)]
+        escalating = {i.number for i, _ in escalate}
+        chase = [(i, d) for i, d in active if i.number not in escalating]
+        if chase:
+            oldest, oldest_days = chase[0]
+            stage = stage_for(oldest_days)
+            if stage is None:
+                not_due.extend(i.number for i, _ in chase)
+            elif new_state.rank(oldest.number) >= RANK[stage]:
+                already.append((cid, stage))
+            elif problem := _contact_problem(customer):
+                hold(cid, [i.number for i, _ in chase], problem, "reminder not drafted: the customer record has no e-mail")
+            else:
+                history = max((sent_counts.get(i.number, 0) for i, _ in chase), default=0)
+                context = RenderContext(customer, tuple(_line(i, d) for i, d in chase), sender, as_of, {}, stamp, reminders_sent=history)
+                drafts.append(render_draft(stage, customer.language, context))
+                for i, d in chase:
+                    own_stage = stage_for(d)
+                    if own_stage:
+                        new_state.record(i.number, own_stage, as_of if d > ESCALATE_AFTER else None)
+        if escalate:
+            active_numbers = [i.number for i, _ in active]
+            stages = {n: new_state.stage_of(n) for n in active_numbers if new_state.stage_of(n)}
+            context = RenderContext(customer, tuple(_line(i, d) for i, d in active), sender, as_of, stages, stamp)
             escalations.append(render_draft("escalation", customer.language, context))
-            for i in over:
+            for i, _ in escalate:
                 new_state.record(i.number, "escalation")
-            continue
-        stage = stage_for(items[0][1])
-        if stage is None:
-            not_due.extend(numbers)
-            continue
-        if new_state.rank(items[0][0].number) >= RANK[stage]:
-            already.append((cid, stage))
-            continue
-        problem = _contact_problem(customer)
-        if problem:
-            hold(cid, numbers, problem, "reminder not drafted: the customer record has no e-mail" if problem == "no_email" else "reminder not drafted: the English greeting needs a contact name")
-            continue
-        context = RenderContext(customer, tuple(_line(i, d) for i, d in items), sender, as_of, {}, stamp)
-        drafts.append(render_draft(stage, customer.language, context))
-        for i, d in items:
-            own_stage = stage_for(d)
-            if own_stage:
-                new_state.record(i.number, own_stage)
+        elif parked:
+            already.append((cid, "escalation"))
 
     thanks: list[Draft] = []
     thank_groups: dict[str, list[tuple[Invoice, Match]]] = {}
@@ -314,7 +381,7 @@ def plan_followups(
             continue
         problem = _contact_problem(customer)
         if problem:
-            hold(cid, numbers, problem, "thank-you not drafted: the customer record has no e-mail" if problem == "no_email" else "thank-you not drafted: the English greeting needs a contact name")
+            hold(cid, numbers, problem, "thank-you not drafted: the customer record has no e-mail")
             continue
         context = RenderContext(customer, tuple(_line(i, 0, m.amount) for i, m in pairs), sender, as_of, {}, stamp)
         thanks.append(render_draft("thanks", customer.language, context))
@@ -328,6 +395,7 @@ def plan_followups(
 __all__ = [
     "STAGES",
     "ESCALATE_AFTER",
+    "ESCALATION_WAIT",
     "RANK",
     "HOLD_REASONS",
     "stage_for",

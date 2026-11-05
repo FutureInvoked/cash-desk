@@ -1,8 +1,8 @@
-Subject: Urgent: {invoices} {age28} ({total})
+Subject: Urgent: {overdue_summary} ({total})
 
-Dear {first_name},
+{greeting_dear}
 
-Despite our earlier reminders, the {invoice_s} below {is_are} still unpaid. {oldest_is} now four weeks past its due date:
+{history}The {invoice_s} below {is_are} still unpaid. {oldest_is} now {age} past its due date:
 
 {invoice_lines}
 

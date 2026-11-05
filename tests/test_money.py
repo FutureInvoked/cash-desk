@@ -66,6 +66,59 @@ def test_parse_amount_rejects_non_amounts(text):
     assert parse_amount(text) is None
 
 
+@pytest.mark.parametrize(
+    "text, lang, value",
+    [
+        ("1250.500", None, "1250.50"),
+        ("1250.500", "cs", "1250.50"),
+        ("1250,500", "en", "1250.50"),
+        ("12500.000", None, "12500.00"),
+        ("1,250.500", None, "1250.50"),
+        ("1.250.000", None, "1250000.00"),
+        ("100.000", "cs", "100000.00"),
+        ("100.000", "en", "100.00"),
+        ("0.500", None, "0.50"),
+        ("0,500", None, "0.50"),
+        ("1250.5000", None, "1250.50"),
+        ("833.3300", None, "833.33"),
+    ],
+)
+def test_three_digits_after_a_long_group_are_decimals(text, lang, value):
+    """A separator before three digits is thousands only after a group of one to three digits."""
+    assert parse_amount(text, lang) == Amount(D(value), None)
+
+
+@pytest.mark.parametrize("text", ["1250.505", "1250.005", "1,250.505", "833.3333", "1.2345"])
+def test_more_than_two_non_zero_decimals_are_refused_when_strict(text):
+    assert parse_amount(text, strict=True) is None
+
+
+def test_more_decimals_round_half_up_when_not_strict():
+    assert parse_amount("1250.505") == Amount(D("1250.51"), None), "a decimal point, never 1,250,505"
+    assert parse_amount("1.005", "en") == Amount(D("1.01"), None)
+    assert parse_amount("1250.500", strict=True) == Amount(D("1250.50"), None)
+
+
+@pytest.mark.parametrize(
+    "text, value, currency",
+    [
+        ("1.200,00-", "-1200.00", None),
+        ("1 200,00 -", "-1200.00", None),
+        ("1200.00- EUR", "-1200.00", "EUR"),
+        ("(1,200.00)", "-1200.00", None),
+        ("(EUR 50.00)", "-50.00", "EUR"),
+        ("12 500,-", "12500.00", None),
+    ],
+)
+def test_trailing_minus_and_parentheses_are_negative(text, value, currency):
+    assert parse_amount(text) == Amount(D(value), currency)
+
+
+@pytest.mark.parametrize("text", ["(1,200.00", "1,200.00)", "-1.200,00-", "(-5.00)", "1250.000.000"])
+def test_unbalanced_or_doubled_signs_are_refused(text):
+    assert parse_amount(text) is None
+
+
 def test_parse_amount_is_decimal_not_float():
     amount = parse_amount("0.10")
     assert amount is not None

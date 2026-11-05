@@ -1,7 +1,7 @@
 # Cash Desk: a Hermes plugin that chases overdue invoices.
 # The model writes the words; the ledger owns the numbers.
 name: cash-desk
-version: "1.0.0"
+version: "1.1.0"
 manifest_version: 2
 api_version: 1
 description: "Chase overdue invoices from CSV exports: match payments to invoices, draft graduated reminders in English and Czech, and send only after a person approves the exact text and Hermes's approval gate asks once more. Figure Lock keeps every amount, invoice number, date, IBAN and reference identical to the ledger."
@@ -84,6 +84,16 @@ config_schema:
     default: "EUR"
     label: "Currency"
     description: "Three-letter currency code (EUR, USD, GBP...) for files without a currency column and for the bundled demo, which is shown in this currency. Files that name their own currency keep it."
+  date_order:
+    type: str
+    default: "auto"
+    label: "Date order in your files"
+    description: "auto (decided from each file), dmy (day first, 05/11/2026 = 5 November) or mdy (month first, 05/11/2026 = May 11). Set it once if your bank or accounting files use slashed dates, so a short file whose dates read both ways imports without asking."
+  ignore_balances_below:
+    type: str
+    default: "10.00"
+    label: "Ignore small open balances below"
+    description: "An open balance under this amount (bank fees, rounding) gets no automatic reminder; it is listed as held so you can write it off or chase it by hand. 0 chases everything."
   guard_outgoing_messages:
     type: bool
     default: false

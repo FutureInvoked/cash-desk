@@ -1,8 +1,8 @@
-Subject: Payment overdue: {invoices} ({total})
+Subject: Payment reminder: {overdue_summary} ({total})
 
-Dear {first_name},
+{greeting_dear}
 
-The {invoice_s} below {remain_s} unpaid. {oldest_is} now three weeks past its due date:
+{history}The {invoice_s} below {remain_s} unpaid. {oldest_is} now {age} past its due date:
 
 {invoice_lines}
 

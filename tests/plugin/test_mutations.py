@@ -12,7 +12,17 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from tests.plugin.support import AS_OF, ROOT, load_demo
+
+# fix/chasing: Stonebridge's 36-day backlog invoice is now a customer reminder (with bank
+# details) instead of an escalation note, so the demo carries 74 figure edits, not 72.
+MEASURED = 74
+
+
+def _readme_says(text: str) -> None:
+    assert text in (ROOT / "README.md").read_text(encoding="utf-8"), f"README.md must say {text!r}"
 
 
 def _bump(ch: str) -> str:
@@ -68,12 +78,12 @@ def test_every_single_digit_change_to_a_demo_figure_is_caught(plugin):
     print(f"\nmutation run: {drafts} drafts, {tried} edits tried, {caught} caught; by kind {by_kind}")
     assert drafts == 7 and tried >= 50
     assert not misses, misses
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert f"{caught} of {tried}" in readme, f"README should say '{caught} of {tried}'"
+    assert caught == tried == MEASURED
+    _readme_says(f"{caught} of {tried}")
 
 
 def test_the_same_run_reports_every_edit_as_a_miss_when_the_lock_is_off(plugin, monkeypatch):
-    """Negative control: with a lock that accepts any text, the harness must see 72 misses."""
+    """Negative control: with a lock that accepts any text, the harness must see every edit (74) as a miss."""
     from dataclasses import replace
 
     module, ctx = plugin
@@ -86,5 +96,5 @@ def test_the_same_run_reports_every_edit_as_a_miss_when_the_lock_is_off(plugin, 
 
     monkeypatch.setattr(engine, "revise", no_lock)
     drafts, tried, caught, misses, _ = run_mutations(module, ctx)
-    assert caught == 0 and len(misses) == tried == 72
-    assert "With the lock switched off\nthe same run reports 72 misses" in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert caught == 0 and len(misses) == tried == MEASURED
+    _readme_says(f"With the lock switched off\nthe same run reports {MEASURED} misses")

@@ -1,4 +1,4 @@
-Předmět: Upomínka: platba po splatnosti ({total})
+Předmět: Upomínka: {overdue_summary} ({total})
 
 Vážená paní, vážený pane,
 
@@ -8,7 +8,7 @@ podle našich záznamů zůstává neuhrazeno:
 
 {payment_details}
 
-Nejstarší položka je již tři týdny po splatnosti. Prosíme o úhradu během tohoto týdne nebo o sdělení termínu platby. Máte-li k faktuře dotaz, odpovězte nám a prověříme ho.
+Nejstarší položka je již {age} po splatnosti. {history}Prosíme o úhradu během tohoto týdne nebo o sdělení termínu platby. Máte-li k faktuře dotaz, odpovězte nám a prověříme ho.
 
 S pozdravem
 {sender}

@@ -1,13 +1,13 @@
-Předmět: Eskalace: {customer} - pohledávky více než 30 dní po splatnosti ({total})
+Předmět: Eskalace: {customer} - {overdue_summary} ({total})
 
 Interní poznámka pro kontrolu. Nic z této poznámky nejde zákazníkovi.
 
-{customer} má pohledávky více než 30 dní po splatnosti:
+Pohledávky zákazníka {customer} po splatnosti, nejstarší více než 30 dní:
 
 {invoice_lines}
 
 Dosud připravené připomínky: {stages}
 
-Rozhodněte o dalším postupu: telefonát, splátkový kalendář, nebo předání odpovědné osobě. Do té doby se pro tohoto zákazníka žádná připomínka nepřipravuje.
+Rozhodněte o dalším postupu: telefonát, splátkový kalendář, nebo předání odpovědné osobě. K fakturám více než 30 dní po splatnosti se do té doby žádná další připomínka nepřipravuje; novější faktury tohoto zákazníka se připomínají podle běžného plánu.
 
 {sender}

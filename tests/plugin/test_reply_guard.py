@@ -73,3 +73,19 @@ def test_the_guard_fails_closed_when_the_ledger_cannot_be_read(guarded, monkeypa
     monkeypatch.setattr(module, "_store", lambda: None)
     assert "could not read the ledger" in guard(GOOD)
     assert guard("Nothing to check here.") is None
+
+
+def test_the_morning_brief_and_a_payer_s_own_payment_pass_the_check(guarded):
+    """Second review: with the check on, the agent could not show the brief or say 'EUR 700.00 waits for review'."""
+    module, ctx, guard = guarded
+    brief = ctx.call("cashdesk_brief")["brief"]
+    assert guard(brief) is None, guard(brief)
+    assert guard("Birchfield Example Consulting GmbH: their EUR 700.00 payment (B1-02) waits for review.") is None
+
+
+def test_another_customer_s_amount_is_still_withheld(guarded):
+    module, ctx, guard = guarded
+    # EUR 4,840.00 is Greenhill's invoice, not Bluebell's
+    assert guard("Bluebell Design Studio Ltd owes EUR 4,840.00 on INV-2026-0042.") is not None
+    # a payment from someone else is not Bluebell's money either
+    assert guard("Bluebell Design Studio Ltd paid EUR 700.00 already.") is not None

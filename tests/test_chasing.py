@@ -1,6 +1,7 @@
 """chasing.py: stages 7/14/21/28 by the oldest invoice, one draft per customer,
-nothing drafted twice, thank-yous once, escalation past 30 days, dispute and
-hold rules, refunds as credit-note questions, reply classification."""
+nothing drafted twice, thank-yous once, escalation past 30 days once the
+stage-28 reminder exists, dispute and hold rules, refunds as credit-note
+questions, reply classification."""
 
 from __future__ import annotations
 
@@ -88,7 +89,7 @@ def test_stage_for():
 def test_stages_by_the_oldest_invoice_one_draft_per_customer():
     p = plan()
     drafts = by_customer(p.drafts)
-    assert {c: d.kind for c, d in drafts.items()} == {"C1": "stage07", "C2": "stage14", "C3": "stage21", "C4": "stage28", "C11": "stage07", "C12": "stage28"}
+    assert {c: d.kind for c, d in drafts.items()} == {"C1": "stage07", "C2": "stage14", "C3": "stage21", "C4": "stage28", "C5": "stage28", "C10": "stage07", "C11": "stage07", "C12": "stage28"}
     assert drafts["C1"].invoice_numbers == ("INV-C1-1", "INV-C1-2"), "every overdue invoice of the customer, oldest first"
     assert drafts["C4"].invoice_numbers == ("INV-C4-1", "INV-C4-2")
     assert drafts["C2"].language == "cs" and "1 250,00 EUR" in drafts["C2"].subject
@@ -114,13 +115,80 @@ def test_dispute_holds_the_whole_customer():
     assert held["C6"].reason == "dispute" and set(held["C6"].invoice_numbers) == {"INV-C6-1", "INV-C6-2"} and "INV-C6-1" in held["C6"].detail
 
 
-def test_escalation_past_30_days_instead_of_a_reminder():
+def test_a_backlog_invoice_past_30_days_gets_a_customer_reminder_first_then_the_escalation():
+    """Kamenný Most's invoice is 36 days overdue on the first run: the customer is reminded (real age,
+    no history claim), and the internal escalation note follows a week later if it is still open."""
     p = plan()
-    assert "C5" not in by_customer(p.drafts)
-    (esc,) = p.escalations
-    assert esc.kind == "escalation" and esc.customer_id == "C5" and esc.recipients == () and "36" in esc.body
-    assert p.state.drafted["INV-C5-1"] == "escalation"
+    reminder = by_customer(p.drafts)["C5"]
+    assert reminder.kind == "stage28" and reminder.recipients == ("c5@example.test",) and "36 dní po splatnosti" in reminder.body
+    assert "předchozí" not in reminder.body and "Navazujeme" not in reminder.body
+    assert p.escalations == () and p.state.drafted["INV-C5-1"] == "stage28@2026-11-10"
+    same_day = plan(state=p.state)
+    assert same_day.escalations == () and ("C5", "stage28") in same_day.already_drafted
+    six_days = plan(state=p.state, as_of=AS_OF + dt.timedelta(days=6))
+    assert "C5" not in by_customer(six_days.drafts) and "C5" not in by_customer(six_days.escalations)
+    week = plan(state=p.state, as_of=AS_OF + dt.timedelta(days=7))
+    esc = by_customer(week.escalations)["C5"]
+    assert esc.kind == "escalation" and esc.recipients == () and "43" in esc.body and "INV-C5-1: připomínka 28" in esc.body
+    assert week.state.drafted["INV-C5-1"] == "escalation" and "C5" not in by_customer(week.drafts)
     assert "C12" not in {e.customer_id for e in p.escalations}, "30 days is stage 28; escalation starts after 30"
+
+
+def test_an_escalation_follows_a_stage_28_reminder_drafted_by_day_30():
+    ledger = [inv("INV-E", "C1", "2026-10-13", "500.00", "EUR")]
+    first = plan(invoices=ledger, customers=CUSTOMERS[:1])
+    assert [d.kind for d in first.drafts] == ["stage28"] and first.state.drafted["INV-E"] == "stage28"
+    later = plan(invoices=ledger, customers=CUSTOMERS[:1], state=first.state, as_of=AS_OF + dt.timedelta(days=3))
+    assert later.drafts == () and [e.customer_id for e in later.escalations] == ["C1"]
+
+
+def test_weekly_runs_do_not_skip_a_stage_passed_between_runs():
+    """Day 27 drafts stage 21; the next weekly run is day 34: stage 28 is drafted, not skipped for the escalation."""
+    ledger = [inv("INV-W", "C1", "2026-10-14", "500.00", "EUR")]
+    day27 = plan(invoices=ledger, customers=CUSTOMERS[:1])
+    assert [d.kind for d in day27.drafts] == ["stage21"]
+    day34 = plan(invoices=ledger, customers=CUSTOMERS[:1], state=day27.state, as_of=AS_OF + dt.timedelta(days=7))
+    assert [d.kind for d in day34.drafts] == ["stage28"] and day34.escalations == ()
+    assert "34 days past its due date" in day34.drafts[0].body and "34 days overdue" in day34.drafts[0].subject
+    day41 = plan(invoices=ledger, customers=CUSTOMERS[:1], state=day34.state, as_of=AS_OF + dt.timedelta(days=14))
+    assert day41.drafts == () and [e.customer_id for e in day41.escalations] == ["C1"]
+    day20 = plan(invoices=ledger, customers=CUSTOMERS[:1], as_of=AS_OF - dt.timedelta(days=7))
+    day27b = plan(invoices=ledger, customers=CUSTOMERS[:1], state=ChaseState({"INV-W": "stage07"}), as_of=AS_OF)
+    assert [d.kind for d in day20.drafts] == ["stage14"] and [d.kind for d in day27b.drafts] == ["stage21"]
+
+
+def test_after_an_escalation_a_new_invoice_of_the_same_customer_is_chased_on_its_own():
+    ledger = [inv("INV-OLD", "C1", "2026-09-01", "800.00", "EUR"), inv("INV-NEW", "C1", "2026-11-03", "50.00", "EUR")]
+    state = ChaseState({"INV-OLD": "escalation"})
+    p = plan(invoices=ledger, customers=CUSTOMERS[:1], state=state)
+    (d,) = p.drafts
+    assert d.kind == "stage07" and d.invoice_numbers == ("INV-NEW",) and "INV-OLD" not in d.body and "EUR 50.00" in d.subject
+    assert p.escalations == () and ("C1", "escalation") in p.already_drafted
+    week = plan(invoices=ledger, customers=CUSTOMERS[:1], state=p.state, as_of=AS_OF + dt.timedelta(days=7))
+    assert [x.kind for x in week.drafts] == ["stage14"] and week.drafts[0].invoice_numbers == ("INV-NEW",)
+
+
+def test_drafts_claim_earlier_reminders_only_when_one_was_sent():
+    ledger = [inv("INV-H", "C1", "2026-10-27", "500.00", "EUR")]
+    first_contact = plan(invoices=ledger, customers=CUSTOMERS[:1]).drafts[0]
+    assert first_contact.kind == "stage14" and first_contact.subject.startswith("Reminder: invoice INV-H is 14 days overdue")
+    assert "earlier" not in first_contact.body and "Second" not in first_contact.subject
+    one_sent = plan(invoices=ledger, customers=CUSTOMERS[:1], reminders_sent=["INV-H"]).drafts[0]
+    assert one_sent.subject.startswith("Second reminder: ") and "This follows our earlier reminder. " in one_sent.body
+    two_sent = plan(invoices=ledger, customers=CUSTOMERS[:1], reminders_sent={"INV-H": 2}).drafts[0]
+    assert two_sent.subject.startswith("Further reminder: ") and "our earlier reminders." in two_sent.body
+    other = plan(invoices=ledger, customers=CUSTOMERS[:1], reminders_sent={"INV-ELSE": 3}).drafts[0]
+    assert "earlier" not in other.body, "a reminder about another invoice is not history for this one"
+
+
+def test_an_open_credit_note_holds_the_customers_reminder():
+    ledger = [inv("INV-B", "C1", "2026-10-22", "900.00", "EUR"), inv("CN-B", "C1", "2026-10-22", "-300.00", "EUR"), inv("INV-O", "C4", "2026-10-22", "100.00", "EUR")]
+    p = plan(invoices=ledger, customers=[CUSTOMERS[0], CUSTOMERS[3]])
+    assert "C1" not in by_customer(p.drafts) and "C4" in by_customer(p.drafts)
+    item = next(h for h in p.held if h.customer_id == "C1")
+    assert item.reason == "credit_note" and set(item.invoice_numbers) == {"INV-B", "CN-B"} and "CN-B" in item.detail
+    applied = [inv("INV-B", "C1", "2026-10-22", "900.00", "EUR"), inv("CN-B", "C1", "2026-10-22", "-300.00", "EUR", status="void")]
+    assert "C1" in by_customer(plan(invoices=applied, customers=CUSTOMERS[:1]).drafts), "a void credit note holds nothing"
 
 
 def test_thank_you_on_applied_payment_in_the_customers_language():
@@ -144,7 +212,9 @@ def test_a_thank_you_for_a_part_payment_does_not_stop_later_stages():
     again = plan(invoices=ledger, customers=CUSTOMERS[:1], applied=second_payment, state=later.state, as_of=AS_OF + dt.timedelta(days=7))
     assert [t.invoice_numbers for t in again.thanks] == [("INV-P",)], "each payment is thanked once"
     much_later = plan(invoices=ledger, customers=CUSTOMERS[:1], applied=[], state=again.state, as_of=AS_OF + dt.timedelta(days=30))
-    assert [e.customer_id for e in much_later.escalations] == ["C1"]
+    assert [d.kind for d in much_later.drafts] == ["stage28"] and much_later.escalations == (), "day 37: the passed stage 28 first"
+    after = plan(invoices=ledger, customers=CUSTOMERS[:1], applied=[], state=much_later.state, as_of=AS_OF + dt.timedelta(days=37))
+    assert [e.customer_id for e in after.escalations] == ["C1"]
 
 
 def test_nothing_is_drafted_twice():
@@ -152,13 +222,16 @@ def test_nothing_is_drafted_twice():
     assert first.state.drafted["INV-C1-1"] == "stage07" and first.state.drafted["INV-C4-1"] == "stage28" and first.state.drafted["INV-C4-2"] == "stage07"
     second = plan(state=first.state)
     assert second.drafts == () and second.thanks == () and second.escalations == ()
-    assert ("C1", "stage07") in second.already_drafted and ("C5", "escalation") in second.already_drafted and ("C7", "thanks") in second.already_drafted
+    assert ("C1", "stage07") in second.already_drafted and ("C5", "stage28") in second.already_drafted and ("C7", "thanks") in second.already_drafted
     week = plan(state=second.state, as_of=AS_OF + dt.timedelta(days=7))
     kinds = {d.customer_id: d.kind for d in week.drafts}
-    assert kinds == {"C1": "stage14", "C2": "stage21", "C3": "stage28", "C11": "stage14"}
-    assert {e.customer_id for e in week.escalations} == {"C4", "C12"}, "Birchfield and Two Currency crossed 30 days; Kamenný Most was escalated already"
+    assert kinds == {"C1": "stage14", "C2": "stage21", "C3": "stage28", "C4": "stage14", "C10": "stage14", "C11": "stage14"}
+    assert by_customer(week.drafts)["C4"].invoice_numbers == ("INV-C4-2",), "the escalated invoice drops out; the newer one keeps its schedule"
+    assert {e.customer_id for e in week.escalations} == {"C4", "C5", "C12"}, "Birchfield and Two Currency crossed 30 days; Kamenný Most's backlog reminder is a week old"
     esc = {e.customer_id: e for e in week.escalations}["C4"]
     assert "INV-C4-1: reminder 28" in esc.body
+    third = plan(state=week.state, as_of=AS_OF + dt.timedelta(days=7))
+    assert third.drafts == () and third.escalations == ()
 
 
 def test_state_round_trips_through_json():
@@ -204,12 +277,15 @@ def test_customer_on_hold_gets_nothing():
     assert item.reason == "on_hold" and item.detail == "asked us to pause"
 
 
-def test_no_email_or_english_without_a_contact_name_is_held_and_listed():
+def test_no_email_is_held_and_listed_no_contact_name_is_greeted_hello():
     p = plan()
     reasons = {h.customer_id: h.reason for h in p.held}
-    assert reasons["C9"] == "no_email" and reasons["C10"] == "no_contact_name"
-    assert "C9" not in by_customer(p.drafts) and "C10" not in by_customer(p.drafts)
+    assert reasons["C9"] == "no_email" and "C10" not in reasons
+    assert "C9" not in by_customer(p.drafts)
+    assert by_customer(p.drafts)["C10"].body.startswith("Hello,\n"), "no contact name: a plain greeting, not a hold"
     assert by_customer(p.drafts)["C11"].body.startswith("Dobrý den"), "Czech needs no first name"
+    nameless_thanks = plan(customers=[cust("C7", "Fernhill Test Media Ltd", contact="")] + CUSTOMERS[:6] + CUSTOMERS[7:])
+    assert by_customer(nameless_thanks.thanks)["C7"].body.startswith("Hello,\n")
     no_mail = plan(customers=[cust("C7", "Fernhill Test Media Ltd", email="")] + CUSTOMERS[:6] + CUSTOMERS[7:])
     assert "C7" not in by_customer(no_mail.thanks) and any(h.customer_id == "C7" and h.reason == "no_email" for h in no_mail.held)
 

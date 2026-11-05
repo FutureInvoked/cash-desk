@@ -103,8 +103,8 @@ function DraftRow({ d, approve, hold, reject }) {
       open ? jsxs('div', { style: styles.hash, children: ['hash ', d.hash] }) : null,
       jsxs('div', { style: { ...styles.row, gap: 8, marginTop: 6 }, children: [
         jsx(FigureBadges, { draft: d }),
-        jsx(Button, { size: 'xs', variant: 'secondary', title: 'Approve exactly this text',
-          onClick: () => approve.mutate({ path: `/drafts/${encodeURIComponent(d.id)}/approve`, body: { hash: d.hash } }), children: 'Approve' }),
+        jsx(Button, { size: 'xs', variant: 'secondary', disabled: !open, title: open ? 'Approve exactly this text' : 'Read the text first: click the subject',
+          onClick: () => open && approve.mutate({ path: `/drafts/${encodeURIComponent(d.id)}/approve`, body: { hash: d.hash } }), children: open ? 'Approve' : 'Read to approve' }),
         jsx(Button, { size: 'xs', variant: 'ghost', title: 'Hold this customer: nothing goes out until released',
           onClick: () => hold.mutate({ path: `/drafts/${encodeURIComponent(d.id)}/hold`, body: { reason: 'held from the Desktop page' } }), children: 'Hold' }),
         jsx(Button, { size: 'xs', variant: 'ghost', title: 'Reject this draft',
@@ -122,16 +122,20 @@ function Queue({ drafts, approve, hold, reject }) {
   ] })
 }
 
-function Review({ payments }) {
+function Review({ payments, apply, dismiss }) {
   if (!payments.length) return jsx('div', { style: styles.muted, children: 'No payment is waiting for a person.' })
   return jsxs('table', { style: styles.table, children: [
     jsx('thead', { children: jsx('tr', { children: ['Payment', 'From', 'Why it was not applied', 'Closest invoices'].map((h, i) => jsx('th', { style: styles.th, children: h }, i)) }) }),
     jsx('tbody', { children: payments.map(p => jsxs('tr', { children: [
       jsxs('td', { style: styles.td, children: [jsx('div', { style: { ...styles.figure, whiteSpace: 'nowrap' }, children: p.amount_display }), jsx('div', { style: { ...styles.muted, whiteSpace: 'nowrap' }, children: `${p.date} · ${p.id}` })] }),
       jsxs('td', { style: styles.td, children: [jsx('div', { children: p.counterparty || '—' }), p.reference ? jsx('div', { style: styles.muted, children: p.reference }) : null] }),
-      jsx('td', { style: { ...styles.td, ...styles.muted }, children: p.why }),
+      jsxs('td', { style: { ...styles.td, ...styles.muted }, children: [p.why,
+        p.incoming ? jsx('div', { style: { marginTop: 6 }, children: jsx(Button, { size: 'xs', variant: 'ghost', title: 'This receipt pays none of these invoices',
+          onClick: () => dismiss.mutate({ path: `/payments/${encodeURIComponent(p.id)}/dismiss`, body: { reason: 'dismissed from the Desktop page' } }), children: 'Dismiss' }) }) : null] }),
       jsx('td', { style: styles.td, children: (p.candidates ?? []).length ? p.candidates.map(c =>
-        jsx('div', { children: jsxs('span', { children: [c.invoice_number, ' · ', c.customer, ' · ', jsx('span', { style: { ...styles.figure, whiteSpace: 'nowrap' }, children: c.balance_display })] }) }, c.invoice_number)) : jsx('span', { style: styles.muted, children: 'none' }) }),
+        jsxs('div', { style: { ...styles.row, gap: 6, marginBottom: 4 }, children: [jsxs('span', { children: [c.invoice_number, ' · ', c.customer, ' · ', jsx('span', { style: { ...styles.figure, whiteSpace: 'nowrap' }, children: c.balance_display })] }),
+          p.incoming ? jsx(Button, { size: 'xs', variant: 'secondary', title: `Apply this payment to ${c.invoice_number} (never more than is open)`,
+            onClick: () => apply.mutate({ path: `/payments/${encodeURIComponent(p.id)}/apply`, body: { invoice_number: c.invoice_number } }), children: 'Apply' }) : null] }, c.invoice_number)) : jsx('span', { style: styles.muted, children: 'none' }) }),
     ] }, p.id)) }),
   ] })
 }
@@ -162,6 +166,8 @@ function Page() {
   const hold = useAction('Customer held; their drafts wait until you release them.')
   const reject = useAction('Draft rejected.')
   const release = useAction('Customer released; held drafts are pending again.')
+  const applyPayment = useAction('Payment applied. Reminders that stated the old amount are redrafted on the next draft run.')
+  const dismissPayment = useAction('Payment dismissed: it pays none of these invoices.')
   const demo = useAction('Demo data loaded (made-up companies, dated so that today is the demo day). Ask the agent to draft today's reminders; drafts appear here.')
   if (status.isLoading) return jsx('div', { style: styles.page, children: jsx(GlyphSpinner, {}) })
   if (status.isError) return jsx('div', { style: styles.page, children: jsx(ErrorState, { title: 'Cash Desk backend unreachable', description: 'Enable cash-desk under plugins.enabled for this profile and restart the gateway.' }) })
@@ -181,7 +187,7 @@ function Page() {
     jsxs('div', { style: styles.row, children: [jsx('h1', { style: styles.h1, children: 'Cash Desk' }), jsx('span', { style: styles.muted, children: snap.chip }), snap.as_of ? jsx('span', { style: styles.muted, children: `as of ${snap.as_of}` }) : null] }),
     jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Open balance by age' }), jsx(Buckets, { snap })] }),
     jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Approval queue' }), jsx(Queue, { drafts: drafts.data?.drafts ?? [], approve, hold, reject })] }),
-    jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Payments to review' }), jsx('div', { style: { ...styles.muted, marginBottom: 6 }, children: 'Only exact reference-and-amount matches are applied. These wait for a person; nothing here is applied.' }), jsx(Review, { payments: review.data?.payments ?? [] })] }),
+    jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Payments to review' }), jsx('div', { style: { ...styles.muted, marginBottom: 6 }, children: 'Only an exact reference and amount from the right payer is applied automatically. These wait for you: Apply puts a payment on an invoice (never more than is open), Dismiss says it pays none of them.' }), jsx(Review, { payments: review.data?.payments ?? [], apply: applyPayment, dismiss: dismissPayment })] }),
     jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'On hold' }), jsx(Holds, { customers: holds.data?.customers ?? [], release })] }),
     jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Activity' }), jsx(Activity, { events: events.data?.events ?? [] })] }),
     jsx('div', { style: styles.muted, children: 'The model writes the words; the ledger owns the numbers. Approving here binds your approval to the exact text; nothing is sent from this page.' }),

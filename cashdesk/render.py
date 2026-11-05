@@ -7,7 +7,14 @@ whose ``figures`` are exactly the amounts, dates, invoice numbers, references
 and IBANs it inserted: the required figure set Figure Lock later enforces.
 
 Czech drafts open with "Dobrý den," because a first name would need the
-vocative; English drafts need a contact's first name and fail without one.
+vocative; English drafts greet the contact's first name ("Hi Jana,", "Dear
+Jana,") or, without one, "Hello,".
+
+History is never assumed: ``RenderContext.reminders_sent`` is how many
+reminders were really sent for these invoices, and only when it is above
+zero does a draft say "Second reminder" or "This follows our earlier
+reminder". Ages are the real days overdue, so a first contact at day 45
+says 45 days, not "four weeks".
 """
 
 from __future__ import annotations
@@ -64,6 +71,7 @@ class RenderContext:
     stages_drafted: Mapping[str, str] = field(default_factory=dict)
     created_at: dt.datetime | None = None
     draft_id: str | None = None
+    reminders_sent: int = 0
 
 
 def load_template(kind: str, lang: str) -> str:
@@ -136,6 +144,43 @@ def payment_details(lines: Sequence[DraftLine], lang: str) -> str:
     return f"Bank details: {', '.join(parts)}. Please quote the payment reference with your transfer."
 
 
+def en_days(n: int) -> str:
+    return f"{n} day" if n == 1 else f"{n} days"
+
+
+def cs_invoices(n: int) -> str:
+    """Czech invoice count: 1 faktura, 2-4 faktury, otherwise faktur."""
+    if n == 1:
+        return "1 faktura"
+    if 2 <= n <= 4:
+        return f"{n} faktury"
+    return f"{n} faktur"
+
+
+def overdue_summary(lines: Sequence[DraftLine], lang: str) -> str:
+    """Subject wording: ``invoice INV-1 is 7 days overdue`` or ``2 invoices overdue, the oldest by 9 days``."""
+    n = len(lines)
+    days = max(l.days_overdue for l in lines)
+    if lang == "cs":
+        if n == 1:
+            return f"faktura {lines[0].number} je {cs_days(days)} po splatnosti"
+        return f"{cs_invoices(n)} po splatnosti, nejstarší {cs_days(days)}"
+    if n == 1:
+        return f"invoice {lines[0].number} is {en_days(days)} overdue"
+    return f"{n} invoices overdue, the oldest by {en_days(days)}"
+
+
+HISTORY = {
+    "en": ("", "This follows our earlier reminder. ", "This follows our earlier reminders. "),
+    "cs": ("", "Navazujeme tím na naši předchozí připomínku. ", "Navazujeme tím na naše předchozí připomínky. "),
+}
+REMINDER_LEAD = {"en": ("Reminder", "Second reminder", "Further reminder"), "cs": ("Připomínka", "Druhá připomínka", "Další připomínka")}
+
+
+def _by_history(table: Mapping[str, tuple[str, str, str]], lang: str, sent: int) -> str:
+    return table[lang][min(max(sent, 0), 2)]
+
+
 def stage_label(stage: str, lang: str) -> str:
     if stage.startswith("stage"):
         return STAGE_LABELS[lang].format(n=int(stage[5:]))
@@ -196,11 +241,13 @@ def render_draft(kind: str, lang: str, context: RenderContext) -> Draft:
     customer = context.customer
     first_name = customer.first_name
     if "{first_name}" in template and not first_name:
-        raise TemplateError(f"customer {customer.id} has no contact name; the {lang} template greets by first name")
+        raise TemplateError(f"customer {customer.id} has no contact name; the {lang} template greets by first name (use {{greeting_hi}} or {{greeting_dear}})")
     totals = sum_by_currency((l.currency, l.amount) for l in lines)
     details = payment_details(lines, lang) if kind in BANK_DETAIL_KINDS else ""
     stages = ", ".join(f"{l.number}: {stage_label(context.stages_drafted[l.number], lang).lower()}" for l in lines if context.stages_drafted.get(l.number)) or NONE_RECORDED[lang]
     n = len(lines)
+    days_max = max(l.days_overdue for l in lines)
+    sent = context.reminders_sent
     mapping = {
         "count": n,
         # English agreement, so a one-invoice reminder never reads "1 invoice(s)".
@@ -219,7 +266,13 @@ def render_draft(kind: str, lang: str, context: RenderContext) -> Draft:
         "sender": sender,
         "customer": customer.name,
         "stages": stages,
-        "days_max": max(l.days_overdue for l in lines),
+        "days_max": days_max,
+        "age": cs_days(days_max) if lang == "cs" else en_days(days_max),
+        "overdue_summary": overdue_summary(lines, lang),
+        "greeting_hi": f"Hi {first_name}," if first_name else "Hello,",
+        "greeting_dear": f"Dear {first_name}," if first_name else "Hello,",
+        "history": _by_history(HISTORY, lang, sent),
+        "reminder_lead": _by_history(REMINDER_LEAD, lang, sent),
     }
     subject_line, _, body_template = template.partition("\n")
     subject = fill_template(_SUBJECT_PREFIX.sub("", subject_line.strip()), mapping).strip()
@@ -254,6 +307,7 @@ __all__ = [
     "invoice_line",
     "payment_details",
     "stage_label",
+    "overdue_summary",
     "line_figures",
     "render_draft",
 ]

@@ -253,7 +253,13 @@ def _event_text(store: Any, engine: Any, e: dict[str, Any]) -> str:
         return f"Imported {what} · {n} {one if n == 1 else many}{skipped}"
     if kind == "match":
         amount = _money(engine, d.get("amount", "0"), d.get("currency", "")) if engine else f"{d.get('currency', '')} {d.get('amount', '')}"
-        return f"Matched payment {d.get('payment', '?')} to {ref} · {amount}"
+        who = " (applied by a person)" if d.get("method") == "person" else ""
+        return f"Matched payment {d.get('payment', '?')} to {ref} · {amount}{who}"
+    if kind == "dismiss":
+        return f"Dismissed payment {ref}: it pays none of the invoices" + (f" ({d['reason']})" if d.get("reason") else "")
+    if kind == "import_kept_payment":
+        kept = _money(engine, d.get("kept_balance", "0"), d.get("currency", "")) if engine else d.get("kept_balance", "")
+        return f"Kept the payment already applied to {ref}: the new export still showed more open, so its open balance stays {kept}"
     if kind == "draft":
         held = " (customer on hold)" if d.get("status") == "held" else ""
         return f"Drafted {_label(d.get('kind', ''))} for {customer_name(d.get('customer', ''))}{held}"
@@ -312,6 +318,7 @@ def review() -> dict[str, Any]:
             items.append({
                 "id": p.id, "date": p.date.isoformat(), "amount_display": _money(engine, p.amount, p.currency),
                 "counterparty": p.counterparty, "reference": p.reference, "kind": item.kind, "why": item.detail,
+                "incoming": p.amount > 0,
                 "candidates": [{"invoice_number": c.invoice_number, "score": round(c.score, 2),
                                 "customer": customers[c.customer_id].name if c.customer_id in customers else c.customer_id,
                                 "balance_display": _money(engine, c.balance, c.currency)} for c in item.candidates[:3]],
@@ -388,6 +395,46 @@ def approve(draft_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]
     try:
         store.approve_draft(draft_id, draft_hash, approved_by="desktop")
         return {"ok": True, "draft": _draft_dict(store, store.get_draft(draft_id))}
+    except Exception as exc:
+        raise _refused(exc) from exc
+    finally:
+        _close(store)
+
+
+@router.post("/payments/{payment_id}/apply")
+def apply_payment(payment_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A person applies a payment waiting for review to one invoice: never more than is left of
+    the payment or open on the invoice. Reminders stating the old amount become stale."""
+    number = str((body or {}).get("invoice_number") or "").strip()
+    if not number:
+        raise HTTPException(status_code=400, detail="invoice_number is required")
+    engine = _engine()
+    raw = (body or {}).get("amount")
+    amount = None
+    if raw not in (None, ""):
+        parsed = engine.parse_amount(str(raw), "en") if engine else None
+        if parsed is None:
+            raise HTTPException(status_code=400, detail=f"{raw!r} is not an amount")
+        amount = parsed.value
+    store = _store_or_503()
+    try:
+        match = store.apply_by_person(payment_id, number, amount, by="desktop")
+        inv = store.get_invoice(number)
+        return {"ok": True, "applied": _money(engine, match.amount, match.currency), "invoice_number": number,
+                "left_display": _money(engine, inv.balance, inv.currency), "status": inv.status}
+    except Exception as exc:
+        raise _refused(exc) from exc
+    finally:
+        _close(store)
+
+
+@router.post("/payments/{payment_id}/dismiss")
+def dismiss_payment(payment_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A person says this receipt pays none of the invoices (other income, a transfer)."""
+    store = _store_or_503()
+    try:
+        store.dismiss_payment(payment_id, str((body or {}).get("reason") or "dismissed from the Desktop page"))
+        return {"ok": True, "payment_id": payment_id}
     except Exception as exc:
         raise _refused(exc) from exc
     finally:

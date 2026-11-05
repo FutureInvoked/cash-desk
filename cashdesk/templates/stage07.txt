@@ -1,6 +1,6 @@
-Subject: Friendly reminder: {invoices} now due ({total})
+Subject: Reminder: {overdue_summary} ({total})
 
-Hi {first_name},
+{greeting_hi}
 
 A quick note that the following {invoice_s} {has_have} passed {its_their} due date:
 

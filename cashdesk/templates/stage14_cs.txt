@@ -1,4 +1,4 @@
-Předmět: Druhá připomínka platby ({total})
+Předmět: {reminder_lead}: {overdue_summary} ({total})
 
 Dobrý den,
 
@@ -8,7 +8,7 @@ podle našich záznamů jsme zatím neobdrželi úhradu za:
 
 {payment_details}
 
-Nejstarší položka je již dva týdny po splatnosti. Prosíme o ověření u vaší účtárny a sdělení termínu úhrady. Pokud je na faktuře něco v nepořádku, odpovězte nám prosím a prověříme ji.
+Nejstarší položka je již {age} po splatnosti. {history}Prosíme o ověření u vaší účtárny a sdělení termínu úhrady. Pokud je na faktuře něco v nepořádku, odpovězte nám prosím a prověříme ji.
 
 S pozdravem
 {sender}

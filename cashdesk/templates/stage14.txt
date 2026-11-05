@@ -1,8 +1,8 @@
-Subject: Second reminder: {invoices} overdue ({total})
+Subject: {reminder_lead}: {overdue_summary} ({total})
 
-Hi {first_name},
+{greeting_hi}
 
-We have not yet received payment for the {invoice_s} below. {oldest_is} now two weeks past its due date:
+{history}We have not yet received payment for the {invoice_s} below. {oldest_is} now {age} past its due date:
 
 {invoice_lines}
 

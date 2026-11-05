@@ -74,16 +74,24 @@ def test_draft_id_is_deterministic_per_kind_customer_day_and_invoices():
 
 def test_english_stage14_text():
     draft = render_draft("stage14", "en", ctx())
-    assert draft.subject == "Second reminder: 1 invoice overdue (EUR 1,250.00)"
-    assert draft.body.startswith("Hi Klaus,\n")
+    assert draft.subject == "Reminder: invoice INV-2026-0042 is 14 days overdue (EUR 1,250.00)"
+    assert draft.body.startswith("Hi Klaus,\n\nWe have not yet received payment")
     assert "  - INV-2026-0042 due 2026-10-27: EUR 1,250.00 (14 days overdue), reference 20260042" in draft.body
     assert "IBAN DE89 3704 0044 0532 0130 00" in draft.body
-    assert "It is now two weeks past its due date" in draft.body
+    assert "It is now 14 days past its due date" in draft.body
+    sent = render_draft("stage14", "en", ctx(reminders_sent=1))
+    assert sent.subject == "Second reminder: invoice INV-2026-0042 is 14 days overdue (EUR 1,250.00)"
+    assert "Hi Klaus,\n\nThis follows our earlier reminder. We have not yet received payment" in sent.body
+    assert sent.figures == draft.figures, "history wording adds no figure"
 
 
 def test_czech_stage14_text():
     draft = render_draft("stage14", "cs", ctx(CS))
-    assert draft.subject == f"Druhá připomínka platby (1{NBSP}250,00{NBSP}EUR)"
+    assert draft.subject == f"Připomínka: faktura INV-2026-0042 je 14 dní po splatnosti (1{NBSP}250,00{NBSP}EUR)"
+    assert "Nejstarší položka je již 14 dní po splatnosti. Prosíme" in draft.body and "předchozí" not in draft.body
+    sent = render_draft("stage14", "cs", ctx(CS, reminders_sent=1))
+    assert sent.subject.startswith("Druhá připomínka: ") and "Navazujeme tím na naši předchozí připomínku. Prosíme" in sent.body
+    assert english_words(sent.body) == [] and english_words(sent.subject) == []
     assert draft.body.startswith("Dobrý den,\n")
     assert f"  - faktura INV-2026-0042, splatná 27. 10. 2026: 1{NBSP}250,00{NBSP}EUR (14 dní po splatnosti), variabilní symbol 20260042" in draft.body
     assert "IBAN DE89 3704 0044 0532 0130 00" in draft.body
@@ -156,8 +164,13 @@ def test_invoice_line_singular_days():
     assert invoice_line(one, "cs") == f"  - faktura X-1, splatná 9. 11. 2026: 5,00{NBSP}EUR (1 den po splatnosti)"
 
 
-def test_missing_first_name_sender_or_lines_fails_instead_of_blank():
+def test_missing_first_name_greets_hello_missing_sender_or_lines_fails_instead_of_blank(monkeypatch):
     nameless = Customer("C9", "No Name Ltd", "en", "x@y.example", "")
+    for kind in ("stage07", "stage14", "stage21", "stage28", "thanks"):
+        assert render_draft(kind, "en", ctx(nameless)).body.startswith("Hello,\n\n"), kind
+    assert render_draft("stage21", "en", ctx()).body.startswith("Dear Klaus,\n")
+    import cashdesk.render as render_module
+    monkeypatch.setitem(render_module._templates, ("stage07", "en"), "Subject: x\n\nHi {first_name},\n\n{invoice_lines}\n{sender}\n")
     with pytest.raises(TemplateError):
         render_draft("stage07", "en", ctx(nameless))
     assert render_draft("stage07", "cs", ctx(Customer("C9", "Bez Jména s.r.o.", "cs", "x@y.example", ""))).body.startswith("Dobrý den")
@@ -197,8 +210,8 @@ def test_english_drafts_say_invoice_or_invoices_never_invoice_s(kind):
     two = render_draft(kind, "en", ctx(EN, (LINE, LINE3)))
     for draft in (one, two):
         assert "(s)" not in draft.subject and "(s)" not in draft.body, (kind, draft.subject)
-    assert "1 invoice " in one.subject or "1 invoice)" in one.subject or kind == "stage21", one.subject
-    assert "2 invoices" in two.subject, two.subject
+    assert "invoice INV-2026-0042 is 14 days overdue (EUR 1,250.00)" in one.subject, one.subject
+    assert "2 invoices overdue, the oldest by 14 days (EUR 2,230.00)" in two.subject, two.subject
     if kind != "escalation":
         assert "The oldest" not in one.body and "The oldest" in two.body or kind == "stage07", one.body
 

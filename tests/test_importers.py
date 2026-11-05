@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from cashdesk.importers import SOURCES, ImportResult, fingerprint, read_bank_csv, read_customers, read_invoices
+from cashdesk.importers import SOURCES, ImportResult, customer_key, fingerprint, read_bank_csv, read_customers, read_invoices
 
 D = Decimal
 
@@ -88,13 +88,16 @@ def test_xero_mapping_derives_customers_and_statuses():
     assert inv["GA-113"].paid_date == dt.date(2026, 10, 24) and inv["GA-113"].balance == D("0.00")
     assert inv["GA-104"].reference == "20261104" and inv["GA-104"].currency == "CZK"
     customers = {c.id: c for c in result.customers}
-    assert set(customers) == {"acme-test-studio", "dolphin-placeholder-s-r-o", "ivy-sample-bv", "gale-test-oy"}
-    assert customers["dolphin-placeholder-s-r-o"].language == "cs"
-    assert customers["acme-test-studio"].email == "jana@acme.example" and customers["acme-test-studio"].contact_name == "Jana Testova"
-    assert inv["GA-101"].customer_id == "acme-test-studio"
+    acme, dolphin = customer_key("Acme Test Studio"), customer_key("Dolphin Placeholder s.r.o.")
+    assert set(customers) == {acme, dolphin, customer_key("Ivy Sample BV"), customer_key("Gale Test Oy")}
+    assert acme.startswith("acme-test-studio-") and dolphin.startswith("dolphin-placeholder-s-r-o-")
+    assert customers[dolphin].language == "cs"
+    assert customers[acme].email == "jana@acme.example" and customers[acme].contact_name == "Jana Testova"
+    assert inv["GA-101"].customer_id == acme
     assert [e.message for e in result.skipped] == ["status DRAFT is not an issued invoice"]
-    assert len(result.errors) == 1 and "duplicate" in result.errors[0].message and "GA-101" in result.errors[0].message
-    assert result.errors[0].row == 8
+    assert [e.code for e in result.skipped] == ["draft"] and result.skipped_counts == {"draft": 1}
+    # the repeated GA-101 row agrees on every invoice-level field: one invoice per line item, not a duplicate
+    assert result.errors == ()
 
 
 def test_quickbooks_mapping_us_dates_and_thousands():
@@ -107,7 +110,9 @@ def test_quickbooks_mapping_us_dates_and_thousands():
     assert inv["1042"].currency == "EUR"
     assert [e.message for e in result.skipped] == ["transaction type Payment is not an invoice"]
     names = {c.id: c.name for c in result.customers}
-    assert names["birchfield-example-consulting-gmbh"] == "Birchfield Example Consulting GmbH"
+    assert names[customer_key("Birchfield Example Consulting GmbH")] == "Birchfield Example Consulting GmbH"
+    assert inv["1042"].customer_id == customer_key("Birchfield Example Consulting GmbH")
+    assert result.credit_notes == () and result.errors == ()
 
 
 def test_stripe_mapping():
@@ -196,8 +201,12 @@ def test_bank_csv_us_dates_with_date_order_mdy():
     text = "id,date,amount,currency,counterparty,reference\nU1,11/06/2026,1250.00,USD,ACME,INV-1\nU2,11/13/2026,10.00,USD,ACME,x\n"
     result = read_bank_csv(text, date_order="mdy")
     assert result.ok and [p.date for p in result.records] == [dt.date(2026, 11, 6), dt.date(2026, 11, 13)]
-    default = read_bank_csv(text)
-    assert default.records[0].date == dt.date(2026, 6, 11) and len(default.errors) == 1, "day first unless told otherwise"
+    inferred = read_bank_csv(text)
+    assert inferred.ok and inferred.date_order == "mdy", "11/13/2026 proves the file is month-first"
+    assert [p.date for p in inferred.records] == [dt.date(2026, 11, 6), dt.date(2026, 11, 13)]
+    assert [p.date for p in read_bank_csv(text, date_order="auto").records] == [dt.date(2026, 11, 6), dt.date(2026, 11, 13)]
+    told = read_bank_csv(text, date_order="dmy")
+    assert told.records[0].date == dt.date(2026, 6, 11) and len(told.errors) == 1, "an explicit order is obeyed"
     with pytest.raises(ValueError):
         read_bank_csv(text, date_order="ymd")
 
@@ -214,5 +223,6 @@ def test_customers_csv():
     c = {x.id: x for x in result.records}
     assert c["C002"].language == "cs" and c["C002"].contact_name == "Petr Ukázka" and not c["C002"].on_hold
     assert c["C006"].on_hold and c["C006"].hold_reason == "dispute on INV-2026-0033"
-    bad = read_customers(CUSTOMERS + "C009,Nowhere,de,,,,\n")
-    assert len(bad.errors) == 1 and "language" in bad.errors[0].message
+    german = read_customers(CUSTOMERS + "C009,Kunde Beispiel GmbH,de,info@kunde.example,Herr Muster,,\n")
+    assert german.ok and {x.id: x for x in german.records}["C009"].language == "en"
+    assert [(w.row, w.code) for w in german.warnings] == [(5, "language")] and "'de'" in german.warnings[0].message

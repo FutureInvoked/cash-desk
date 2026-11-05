@@ -484,6 +484,41 @@ def check(text: str, lang: str, required: Iterable[Figure], allowed: Iterable[Fi
     return LockResult(ok, missing, extra, tuple(changed), tuple(diff), found)
 
 
+# ---------------------------------------------------- what a rewording may not add
+
+URL_RE = re.compile(r"(?:\bhttps?://|\bwww\.)[^\s<>\"')\]]+|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}/[^\s<>\"')\]]*", re.IGNORECASE)
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+PERCENT_RE = re.compile(r"\b\d+(?:[.,]\d+)?\s?(?:%|per\s?cent\b|procent[a-zů]*\b)", re.IGNORECASE)
+TERM_RE = re.compile(
+    r"\b(court|lawsuit|sue|suing|legal action|legal proceedings|solicitors?|attorneys?|lawyers?|bailiffs?|"
+    r"debt collect(?:ion|ors?|ing)|collection agency|interest|penalt(?:y|ies)|late fees?|surcharge|"
+    r"discount|waive[sd]?|write[- ]off|settle(?:ment)? for|full and final|(?:in |as )?full settlement|half (?:of )?the|"
+    r"suspend(?:ed|s)?|suspension|cut off|disconnect(?:ed)?|blacklist(?:ed)?|"
+    r"pozastav\w*|polovin\w*|odpoj\w*|"
+    r"soud\w*|žalob\w*|exekuc\w*|advokát\w*|inkas\w*|úrok\w*|penále|sleva|slevu|odpust\w*)\b",
+    re.IGNORECASE)
+NEW_KIND_LABEL = {"link": "link", "email": "email address", "percent": "percentage", "term": "term"}
+
+
+def added_terms(old_text: str, new_text: str) -> list[tuple[str, str, int]]:
+    """Links, email addresses, percentages and legal / discount / interest terms that ``new_text``
+    has and ``old_text`` did not: a rewording may change the words, not where money goes, who to
+    write to, or the terms. Returns (kind, value, line) in order of appearance."""
+    out: list[tuple[str, str, int]] = []
+    for kind, pattern in (("link", URL_RE), ("email", EMAIL_RE), ("percent", PERCENT_RE), ("term", TERM_RE)):
+        before = {m.group(0).rstrip(".,;:").casefold() for m in pattern.finditer(old_text or "")}
+        seen: set[str] = set()
+        for m in pattern.finditer(new_text or ""):
+            value = m.group(0).rstrip(".,;:")
+            key = value.casefold()
+            if key in before or key in seen:
+                continue
+            seen.add(key)
+            out.append((kind, value, new_text.count("\n", 0, m.start()) + 1))
+    out.sort(key=lambda x: x[2])
+    return out
+
+
 def revise(draft: Draft, new_text: str, allowed: Iterable[Figure], new_subject: str | None = None) -> RevisionResult:
     """Apply ``new_text`` (and optionally a new subject) to ``draft`` only when the lock passes.
 
@@ -493,6 +528,11 @@ def revise(draft: Draft, new_text: str, allowed: Iterable[Figure], new_subject: 
     """
     subject = draft.subject if new_subject is None else new_subject
     lock = check(f"{subject}\n{new_text}", draft.language, draft.figures, allowed)
+    added = added_terms(f"{draft.subject}\n{draft.body}", f"{subject}\n{new_text}")
+    if added:
+        notes = tuple(f"added: {NEW_KIND_LABEL[k]} {v!r} is not in the drafted text (line {line}); a rewording may not add "
+                      "links, email addresses, percentages, or legal, settlement, interest or suspension terms" for k, v, line in added)
+        lock = replace(lock, ok=False, diff=lock.diff + notes)
     if not lock.ok:
         return RevisionResult(False, draft, lock)
     revised = with_hash(replace(draft, subject=subject, body=new_text, status="pending"))
@@ -509,6 +549,7 @@ __all__ = [
     "iban_valid",
     "extract_figures",
     "unknown_figures",
+    "added_terms",
     "broken_amounts",
     "ledger_figures",
     "describe",

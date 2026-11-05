@@ -24,7 +24,7 @@ import os
 import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from .approval import idempotency_key, verify_hash
@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT NOT NULL DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS chase_state (invoice_number TEXT PRIMARY KEY, stage TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS briefs (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS dismissed (payment_id TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT '', at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS draft_basis (draft_id TEXT NOT NULL, invoice_number TEXT NOT NULL, balance TEXT NOT NULL, currency TEXT NOT NULL,
+    due_date TEXT NOT NULL, PRIMARY KEY (draft_id, invoice_number));
+CREATE TABLE IF NOT EXISTS invoice_sources (number TEXT PRIMARY KEY, source TEXT NOT NULL, file TEXT NOT NULL DEFAULT '', at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS missing_from_export (number TEXT PRIMARY KEY, file TEXT NOT NULL DEFAULT '', at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS snoozes (customer_id TEXT PRIMARY KEY, until TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', at TEXT NOT NULL);
 """
 
 
@@ -285,7 +291,7 @@ class Store:
             self.log_event("import", result.fingerprint, detail, at)
 
     def ingest(self, result: ImportResult, at: dt.datetime | None = None, allow_errors: bool = False,
-               file_name: str = "") -> dict[str, int]:
+               file_name: str = "", open_list: bool = False) -> dict[str, int]:
         """Record the import and write its records in one transaction.
 
         Refuses a result with row errors unless ``allow_errors`` is set, so a
@@ -301,14 +307,63 @@ class Store:
             if result.kind == "customers":
                 counts["customers"] = self.upsert_customers(result.records, at)
             elif result.kind == "invoices":
-                if result.customers:
-                    counts["customers"] = self.upsert_customers(result.customers, at, mode="fill")
-                counts["invoices"] = self.upsert_invoices(result.records, at)
+                records = list(result.records)
+                derived = list(result.customers)
+                if derived:
+                    # a customer the ledger already knows under another id (a customers file with its own ids)
+                    # is the same customer: match on the exact name instead of creating a twin
+                    by_name = {" ".join(c.name.split()).casefold(): c.id for c in self.list_customers()}
+                    known = {c.id for c in self.list_customers()}
+                    remap = {c.id: by_name[" ".join(c.name.split()).casefold()] for c in derived
+                             if c.id not in known and " ".join(c.name.split()).casefold() in by_name}
+                    if remap:
+                        records = [replace(inv, customer_id=remap.get(inv.customer_id, inv.customer_id)) for inv in records]
+                        derived = [c for c in derived if c.id not in remap]
+                    if derived:
+                        counts["customers"] = self.upsert_customers(derived, at, mode="fill")
+                counts["invoices"] = self.upsert_invoices(records, at)
+                c = self._conn
+                c.executemany("INSERT OR REPLACE INTO invoice_sources (number, source, file, at) VALUES (?, ?, ?, ?)",
+                              [(inv.number, result.source, file_name, _ts(at)) for inv in records])
+                c.executemany("DELETE FROM missing_from_export WHERE number = ?", [(inv.number,) for inv in records])
+                if open_list:
+                    present = {inv.number for inv in records}
+                    gone = [r["number"] for r in c.execute(
+                        "SELECT i.number FROM invoices i JOIN invoice_sources s ON s.number = i.number "
+                        "WHERE s.source = ? AND i.status IN ('open', 'disputed') AND CAST(i.balance AS REAL) > 0", (result.source,)).fetchall()
+                        if r["number"] not in present]
+                    c.executemany("INSERT OR REPLACE INTO missing_from_export (number, file, at) VALUES (?, ?, ?)", [(n, file_name, _ts(at)) for n in gone])
+                    for n in gone:
+                        self.log_event("not_in_export", n, {"file": file_name}, at)
+                    counts["not_in_export"] = len(gone)
+                credits = tuple(getattr(result, "credit_notes", ()) or ())
+                if credits:
+                    counts["credit_notes"] = self.upsert_invoices(_credit_invoices(credits, at), at)
             elif result.kind == "bank":
                 counts["payments"] = self.add_payments(result.records, at)
             else:
                 raise ConflictError(f"unknown import kind {result.kind!r}")
         return counts
+
+    def missing_from_export(self) -> dict[str, str]:
+        """Open invoices that the latest open-invoice export of their source no longer lists -> that file."""
+        return {r["number"]: r["file"] for r in self._conn.execute("SELECT number, file FROM missing_from_export").fetchall()}
+
+    def snooze(self, customer_id: str, until: dt.date, reason: str = "", at: dt.datetime | None = None) -> None:
+        """The customer promised to pay by ``until``: no reminder until then (and a short grace)."""
+        self.get_customer(customer_id)
+        with self._tx() as c:
+            c.execute("INSERT OR REPLACE INTO snoozes (customer_id, until, reason, at) VALUES (?, ?, ?, ?)", (customer_id, until.isoformat(), reason, _ts(at)))
+            self.log_event("snooze", customer_id, {"until": until.isoformat(), "reason": reason}, at)
+
+    def snoozed(self, as_of: dt.date, grace_days: int = 2) -> dict[str, tuple[dt.date, str]]:
+        """Customers whose promise to pay has not run out on ``as_of`` -> (promised date, reason)."""
+        out = {}
+        for r in self._conn.execute("SELECT * FROM snoozes").fetchall():
+            until = dt.date.fromisoformat(r["until"])
+            if as_of <= until + dt.timedelta(days=grace_days):
+                out[r["customer_id"]] = (until, r["reason"])
+        return out
 
     def list_imports(self) -> list[ImportRecord]:
         rows = self._conn.execute("SELECT * FROM imports ORDER BY imported_at, rowid").fetchall()
@@ -396,9 +451,13 @@ class Store:
         return None
 
     def _stale_reason(self, draft: Draft) -> str | None:
-        """A reminder whose invoices are no longer all open must be redrafted."""
+        """A reminder must still be true when it is approved and when it is sent: every invoice
+        open, and its open balance and due date still the figures the draft states."""
         if draft.kind not in REMINDER_KINDS:
             return None
+        money = {f.canonical for f in draft.figures if f.kind == "money"}
+        dates = {f.canonical for f in draft.figures if f.kind == "date"}
+        basis = {r["invoice_number"]: r for r in self._conn.execute("SELECT * FROM draft_basis WHERE draft_id = ?", (draft.id,)).fetchall()}
         for number in draft.invoice_numbers:
             row = self._conn.execute("SELECT * FROM invoices WHERE number = ?", (number,)).fetchone()
             if row is None:
@@ -406,14 +465,50 @@ class Store:
             inv = _invoice(row)
             if not inv.is_open:
                 return f"{number} is {inv.status}; redraft before approving"
+            was = basis.get(number)
+            if was is not None:
+                if (Decimal(was["balance"]), was["currency"]) != (inv.balance, inv.currency):
+                    return f"{number} now has {inv.currency} {inv.balance:,.2f} open, not the amount this draft states; redraft before approving"
+                if was["due_date"] != inv.due_date.isoformat():
+                    return f"{number} is now due {inv.due_date.isoformat()}, not the date this draft states; redraft before approving"
+                continue
+            if money and f"{inv.currency} {inv.balance:.2f}" not in money:
+                return f"{number} now has {inv.currency} {inv.balance:,.2f} open, not the amount this draft states; redraft before approving"
+            if dates and inv.due_date.isoformat() not in dates:
+                return f"{number} is now due {inv.due_date.isoformat()}, not the date this draft states; redraft before approving"
         return None
+
+    def stale_drafts(self) -> list[tuple[Draft, str]]:
+        """Pending or approved reminders that are no longer true, with the reason."""
+        out = []
+        for d in self.list_drafts():
+            if d.status in ("pending", "approved", "held"):
+                why = self._stale_reason(d)
+                if why:
+                    out.append((d, why))
+        return out
+
+    def _applied_total(self, c: sqlite3.Connection, number: str) -> Decimal | None:
+        rows = c.execute("SELECT amount FROM matches WHERE invoice_number = ?", (number,)).fetchall()
+        return sum((Decimal(r["amount"]) for r in rows), Decimal("0")) if rows else None
 
     # ------------------------------------------------------------ invoices
 
     def upsert_invoices(self, invoices: Iterable[Invoice], at: dt.datetime | None = None) -> int:
+        """Insert or update invoices from an export. Payments Cash Desk already applied are
+        never undone by an older export: the open balance kept is the lower of the export's
+        balance and the invoice amount minus what was applied here."""
         n = 0
         with self._tx() as c:
             for inv in invoices:
+                applied = self._applied_total(c, inv.number)
+                if applied is not None and inv.status in ("open", "paid", "disputed"):
+                    kept = max(Decimal("0.00"), min(inv.balance, inv.amount - applied)).quantize(Decimal("0.01"))
+                    if kept != inv.balance:
+                        prior = c.execute("SELECT paid_date FROM invoices WHERE number = ?", (inv.number,)).fetchone()
+                        paid = inv.paid_date or (_d(prior["paid_date"]) if prior else None)
+                        self.log_event("import_kept_payment", inv.number, {"export_balance": str(inv.balance), "kept_balance": str(kept), "applied": str(applied), "currency": inv.currency}, at)
+                        inv = replace(inv, balance=kept, status="paid" if kept <= 0 else inv.status, paid_date=paid if kept <= 0 else inv.paid_date)
                 c.execute(
                     """INSERT INTO invoices (number, customer_id, issue_date, due_date, amount, currency, balance, status, reference, iban, paid_date, note, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -468,9 +563,65 @@ class Store:
         return [_payment(r) for r in self._conn.execute("SELECT * FROM payments ORDER BY date, id").fetchall()]
 
     def unapplied_payments(self) -> list[Payment]:
-        """Payments with no applied match: what the next matching run should look at."""
-        rows = self._conn.execute("SELECT * FROM payments WHERE id NOT IN (SELECT payment_id FROM matches) ORDER BY date, id").fetchall()
-        return [_payment(r) for r in rows]
+        """Receipts with money not yet applied and not dismissed by a person: what the next
+        matching run looks at. A payment a person split in part comes back with what is left."""
+        out = []
+        for r in self._conn.execute("SELECT * FROM payments WHERE id NOT IN (SELECT payment_id FROM dismissed) ORDER BY date, id").fetchall():
+            p = _payment(r)
+            used = self.applied_from(p.id)
+            if used == 0:
+                out.append(p)
+            elif p.amount > 0 and used < p.amount:
+                out.append(replace(p, amount=p.amount - used))
+        return out
+
+    def applied_from(self, payment_id: str) -> Decimal:
+        rows = self._conn.execute("SELECT amount FROM matches WHERE payment_id = ?", (payment_id,)).fetchall()
+        return sum((Decimal(r["amount"]) for r in rows), Decimal("0"))
+
+    def apply_by_person(self, payment_id: str, invoice_number: str, amount: Decimal | None = None,
+                        by: str = "", at: dt.datetime | None = None) -> Match:
+        """A person applies (part of) a payment that matching left for review. Never more than is
+        left of the payment or open on the invoice; same currency only."""
+        p = self.get_payment(payment_id)
+        if p is None:
+            raise NotFoundError(f"no payment {payment_id!r}")
+        if p.amount <= 0:
+            raise ConflictError(f"{payment_id} is money going out, not a receipt; it cannot pay an invoice")
+        if self._conn.execute("SELECT 1 FROM dismissed WHERE payment_id = ?", (payment_id,)).fetchone():
+            raise ConflictError(f"{payment_id} was dismissed; it cannot be applied")
+        inv = self.get_invoice(invoice_number)
+        if not inv.is_open or inv.balance <= 0:
+            raise ConflictError(f"{invoice_number} is {inv.status} with nothing open")
+        if inv.currency != p.currency:
+            raise ConflictError(f"{payment_id} is in {p.currency}, {invoice_number} in {inv.currency}")
+        left = p.amount - self.applied_from(payment_id)
+        if left <= 0:
+            raise ConflictError(f"{payment_id} is already fully applied")
+        value = (amount if amount is not None else min(left, inv.balance)).quantize(Decimal("0.01"))
+        if value <= 0:
+            raise ConflictError("the amount to apply must be more than zero")
+        if value > left:
+            raise ConflictError(f"only {p.currency} {left:,.2f} of {payment_id} is left to apply")
+        if value > inv.balance:
+            raise ConflictError(f"only {inv.currency} {inv.balance:,.2f} is open on {invoice_number}")
+        match = Match(payment_id, invoice_number, value, p.currency, "person", "person",
+                      f"applied by a person{(' (' + by + ')') if by else ''}")
+        if not self.apply_match(match, at):
+            raise ConflictError(f"{payment_id} is already applied to {invoice_number}")
+        return match
+
+    def dismiss_payment(self, payment_id: str, reason: str = "", at: dt.datetime | None = None) -> None:
+        """A person says a receipt pays none of these invoices (other income, a transfer): it leaves review."""
+        if self.get_payment(payment_id) is None:
+            raise NotFoundError(f"no payment {payment_id!r}")
+        p = self.get_payment(payment_id)
+        used = self.applied_from(payment_id)
+        if used >= p.amount > 0:
+            raise ConflictError(f"{payment_id} is already fully applied; there is nothing left to dismiss")
+        with self._tx() as c:
+            c.execute("INSERT OR REPLACE INTO dismissed (payment_id, reason, at) VALUES (?, ?, ?)", (payment_id, reason, _ts(at)))
+            self.log_event("dismiss", payment_id, {"reason": reason}, at)
 
     def apply_match(self, match: Match, at: dt.datetime | None = None) -> bool:
         """Apply a match to its invoice once. False when this payment/invoice pair is already applied."""
@@ -511,11 +662,15 @@ class Store:
         """Insert a draft. The same draft again is a no-op; a different text under the same id is refused."""
         self._check_hash(draft)
         with self._tx() as c:
-            row = c.execute("SELECT hash FROM drafts WHERE id = ?", (draft.id,)).fetchone()
+            row = c.execute("SELECT hash, status FROM drafts WHERE id = ?", (draft.id,)).fetchone()
             if row is not None:
                 if row["hash"] == draft.hash:
                     return False
-                raise ConflictError(f"draft {draft.id} already exists with a different text; use replace_draft to revise it")
+                if row["status"] != "rejected":
+                    raise ConflictError(f"draft {draft.id} already exists with a different text; use replace_draft to revise it")
+                # a rejected (or superseded) draft of the same day: the new, different text takes its place
+                c.execute("DELETE FROM drafts WHERE id = ?", (draft.id,))
+                c.execute("DELETE FROM approvals WHERE draft_id = ?", (draft.id,))
             customer = c.execute("SELECT on_hold FROM customers WHERE id = ?", (draft.customer_id,)).fetchone()
             status = "held" if (customer and customer["on_hold"] and draft.status == "pending") else draft.status
             c.execute(
@@ -523,6 +678,12 @@ class Store:
                 (draft.id, draft.kind, draft.customer_id, json.dumps(list(draft.invoice_numbers)), draft.language, draft.subject, draft.body,
                  json.dumps(list(draft.recipients)), _ts(draft.created_at), status, draft.hash, _figures_json(draft.figures), _ts(at)),
             )
+            c.execute("DELETE FROM draft_basis WHERE draft_id = ?", (draft.id,))
+            for number in draft.invoice_numbers:
+                row = c.execute("SELECT balance, currency, due_date FROM invoices WHERE number = ?", (number,)).fetchone()
+                if row is not None:
+                    c.execute("INSERT INTO draft_basis (draft_id, invoice_number, balance, currency, due_date) VALUES (?, ?, ?, ?, ?)",
+                              (draft.id, number, row["balance"], row["currency"], row["due_date"]))
             self.log_event("draft", draft.id, {"kind": draft.kind, "customer": draft.customer_id, "status": status}, at)
             return True
 
@@ -568,13 +729,17 @@ class Store:
             c.execute("DELETE FROM approvals WHERE draft_id = ?", (draft.id,))
             self.log_event("revise", draft.id, {"hash": draft.hash}, at)
 
-    def reject_draft(self, draft_id: str, reason: str = "", at: dt.datetime | None = None) -> None:
+    def reject_draft(self, draft_id: str, reason: str = "", at: dt.datetime | None = None, reset_stage: bool = True) -> None:
         with self._tx() as c:
             current = self.get_draft(draft_id)
             if current.status == "sent":
                 raise ConflictError(f"draft {draft_id} was already sent")
             c.execute("UPDATE drafts SET status = 'rejected', updated_at = ? WHERE id = ?", (_ts(at), draft_id))
             c.execute("DELETE FROM approvals WHERE draft_id = ?", (draft_id,))
+            if reset_stage and current.kind in REMINDER_KINDS:
+                # the next drafting run may write this stage again (a person rejected the text, not the chase);
+                # a rejected escalation note keeps its stage, so the customer is not chased again for it
+                c.executemany("DELETE FROM chase_state WHERE invoice_number = ? AND stage != 'thanks'", [(n,) for n in current.invoice_numbers])
             self.log_event("reject", draft_id, {"reason": reason}, at)
 
     # ---------------------------------------------------- approvals, sends
@@ -659,6 +824,17 @@ class Store:
             self.confirm_send(key, at)
             return key
 
+    def reminders_sent(self) -> dict[str, int]:
+        """Invoice number -> how many customer reminders about it really went out (sent, not just drafted)."""
+        counts: dict[str, int] = {}
+        rows = self._conn.execute(
+            "SELECT d.invoice_numbers FROM sends s JOIN drafts d ON d.id = s.draft_id WHERE s.status = 'sent' AND d.kind IN ('stage07', 'stage14', 'stage21', 'stage28')"
+        ).fetchall()
+        for r in rows:
+            for number in json.loads(r["invoice_numbers"]):
+                counts[number] = counts.get(number, 0) + 1
+        return counts
+
     def list_sends(self) -> list[SendRecord]:
         rows = self._conn.execute("SELECT * FROM sends ORDER BY reserved_at, rowid").fetchall()
         return [SendRecord(r["idempotency_key"], r["draft_id"], r["hash"], _dt(r["sent_at"]), r["mode"], r["status"], _dt(r["reserved_at"]), r["note"]) for r in rows]
@@ -736,6 +912,20 @@ class Store:
 
 
 # ------------------------------------------------------------ row mapping
+
+
+def _credit_invoices(credits: Iterable, at: dt.datetime | None) -> list[Invoice]:
+    """Credit notes / credit memos / unapplied payments from an export, kept as negative open
+    invoices: never chased, and an open one holds that customer's reminders until a person decides."""
+    day = _now(at).date()
+    out = []
+    for cn in credits:
+        number = cn.number or f"CREDIT-{cn.customer_id}-{cn.row}"
+        when = cn.date or day
+        value = -abs(Decimal(cn.amount))
+        out.append(Invoice(number, cn.customer_id, when, when, value, cn.currency, value, "open",
+                           note=f"{cn.kind.replace('_', ' ')} from the export; a person decides which invoice it settles"))
+    return out
 
 
 def _customer(r: sqlite3.Row) -> Customer:

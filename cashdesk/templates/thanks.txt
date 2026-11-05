@@ -1,6 +1,6 @@
 Subject: Thank you for your payment ({total})
 
-Hi {first_name},
+{greeting_hi}
 
 Thank you, we have received your payment for:
 

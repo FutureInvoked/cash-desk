@@ -2,7 +2,9 @@
 
 A payment is applied automatically when its reference names exactly one ledger
 invoice (invoice number with any separators, or the Czech variable symbol),
-in that invoice's currency, for exactly its open balance. Every other receipt
+in that invoice's currency, for exactly its open balance, from a payer whose
+name fits that invoice's customer (or a bank line with no payer name), dated
+no earlier than the invoice. Every other receipt
 becomes a review item with up to three fuzzy candidates scored by amount,
 customer name similarity and date window, or is reported unmatched. Refunds
 (outgoing lines, or anything with refund words) are credit-note questions and
@@ -35,7 +37,9 @@ MAX_CANDIDATES = 3
 MAX_COMBINATION = 4
 MIN_REFERENCE_DIGITS = 3
 
-REVIEW_KINDS = ("MISSING", "AMBIGUOUS", "PARTIAL", "OVERPAID", "MULTI_INVOICE", "CURRENCY", "ALREADY_PAID", "VOID", "AFTER_AS_OF", "CREDIT_NOTE", "UNMATCHED")
+REVIEW_KINDS = ("MISSING", "AMBIGUOUS", "PARTIAL", "OVERPAID", "MULTI_INVOICE", "CURRENCY", "ALREADY_PAID", "VOID", "AFTER_AS_OF", "CREDIT_NOTE", "UNMATCHED",
+                "PAYER", "EARLY")
+EARLY_GRACE = dt.timedelta(days=3)  # a payment this much before the invoice date is still believable (clock or booking lag)
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,17 @@ def name_similarity(a: str, b: str) -> float:
     if na == nb:
         return 1.0
     return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def payer_fits(customer_name: str, counterparty: str) -> bool:
+    """True when the bank's payer name could be this customer: no payer name at all, a close
+    name, or a shared distinctive word (bank lines often truncate: ``BLUEBELL DESIGN ST``)."""
+    if not (counterparty or "").strip():
+        return True
+    if name_similarity(customer_name, counterparty) >= NAME_MIN:
+        return True
+    words = lambda text: {w for w in normalise_name(text).split() if len(w) >= 4}
+    return bool(words(customer_name) & words(counterparty))
 
 
 def is_refund(text: str) -> bool:
@@ -310,6 +325,10 @@ def match_payments(
             queue(p, "PARTIAL", f"{m(amt, cur)} received, {m(bal, cur)} open; {m(bal - amt, cur)} would remain", named)
         elif amt > bal:
             queue(p, "OVERPAID", f"{m(amt, cur)} received, only {m(bal, cur)} open; {m(amt - bal, cur)} extra", named)
+        elif not payer_fits(ledger.name(inv), p.counterparty):
+            queue(p, "PAYER", f"reference names {no} ({ledger.name(inv)}) but the payer is '{p.counterparty}'; check who paid before applying", named)
+        elif p.date < inv.issue_date - EARLY_GRACE:
+            queue(p, "EARLY", f"dated {p.date.isoformat()}, before {no} was issued ({inv.issue_date.isoformat()}); check the dates before applying", named)
         else:
             applied.append(Match(p.id, no, amt, cur, "reference+exact", "high", f"reference names {no} and {m(amt, cur)} equals its open balance"))
             ledger.balance[no] = Decimal("0.00")
@@ -327,6 +346,7 @@ __all__ = [
     "normalise_name",
     "name_similarity",
     "is_refund",
+    "payer_fits",
     "invoices_named",
     "match_payments",
 ]

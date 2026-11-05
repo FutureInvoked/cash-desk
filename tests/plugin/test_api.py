@@ -49,7 +49,7 @@ def test_queue_approve_hold_release(client):
     drafts = api.get("/drafts").json()["drafts"]
     draft = next(d for d in drafts if d["kind"] == "stage14")
     assert draft["body"] and draft["figures"] and draft["customer"]
-    assert draft["label"] == "Reminder 14" and {d["label"] for d in drafts} >= {"Reminder 7", "Thank-you", "Escalation"}
+    assert draft["label"] == "Reminder 14" and {d["label"] for d in drafts} >= {"Reminder 7", "Reminder 28", "Thank-you"}
     assert api.post(f"/drafts/{draft['id']}/approve", json={}).status_code == 400
     assert api.post(f"/drafts/{draft['id']}/approve", json={"hash": "0" * 64}).status_code == 409
     assert api.post("/drafts/nope/approve", json={"hash": "0" * 64}).status_code == 404
@@ -158,3 +158,31 @@ def test_activity_reads_as_plain_sentences(client):
     assert "Approved Reminder 7 for Northgate Sample Studio Ltd on the Desktop" in joined
     assert not re.search(r"[0-9a-f]{16,}", joined), joined
     assert not any("-nov10" in t for t in texts), "draft ids are not shown to people"
+
+
+def test_a_person_applies_or_dismisses_a_review_payment_from_the_page(client):
+    """Judge: nothing on the page could resolve a payment in review."""
+    api, ctx = client
+    assert api.post("/demo").status_code == 200
+    (item,) = api.get("/review").json()["payments"]
+    assert item["incoming"] is True
+    target = item["candidates"][0]["invoice_number"]  # INV-2026-0044, EUR 720.00 open
+    assert api.post(f"/payments/{item['id']}/apply", json={"invoice_number": target, "amount": "900"}).status_code >= 400
+    done = api.post(f"/payments/{item['id']}/apply", json={"invoice_number": target}).json()
+    assert done["ok"] and done["applied"].endswith("700.00") and done["left_display"].endswith("20.00")
+    assert api.get("/review").json()["payments"] == []
+    assert api.post(f"/payments/{item['id']}/dismiss", json={}).status_code >= 400  # already applied
+    assert api.post("/payments/NOPE/apply", json={"invoice_number": target}).status_code >= 400
+
+
+def test_activity_says_in_words_what_a_person_or_a_newer_export_did(client, hermes_fakes):
+    api, ctx = client
+    assert api.post("/demo").status_code == 200
+    data = hermes_fakes / "plugin-data" / "cash-desk"
+    text = (ROOT / "demo" / "invoices.csv").read_text(encoding="utf-8")
+    (data / "invoices-next.csv").write_text(text + "INV-2026-0050,C001,2026-11-05,2026-11-19,300.00,EUR,300.00,open,20260050,DE89 3704 0044 0532 0130 00\n", encoding="utf-8")
+    assert ctx.call("cashdesk_import", kind="invoices", path=str(data / "invoices-next.csv"), source="generic")["ok"]
+    assert ctx.command("apply B1-02 INV-2026-0044").startswith("Applied")
+    texts = [e["text"] for e in api.get("/events?limit=80").json()["events"]]
+    assert any(t.startswith("Kept the payment already applied to INV-2026-0045") and t.endswith("EUR 0.00") for t in texts), texts
+    assert any(t.startswith("Matched payment B1-02 to INV-2026-0044") and t.endswith("(applied by a person)") for t in texts), texts

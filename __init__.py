@@ -17,10 +17,11 @@ read.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import logging
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +44,9 @@ WRITE_TOOLS = frozenset({
     "cashdesk_reply", "cashdesk_hold", SEND_TOOL,
 })
 COMMAND_HELP = (
-    "/cashdesk status | queue | approve <draft-id> [hash-prefix] | reject <draft-id> [reason] | "
-    "hold <customer-id> [reason] | release <customer-id>"
+    "/cashdesk status | queue | approve <draft-id> <hash-prefix> | reject <draft-id> [reason] | "
+    "hold <customer-id> [reason] | release <customer-id> | review | apply <payment-id> <invoice> [amount] | "
+    "dismiss <payment-id> [reason]"
 )
 
 # Set in register(); the gate asks Hermes whether the current code runs inside a
@@ -85,8 +87,9 @@ IMPORT_SCHEMA = _schema(
         "path": {"type": "string", "description": "Path of the CSV file. Relative paths start at the plugin folder; only the plugin data folder, demo/ and the import_dirs setting are readable. The bundled demo is four files, imported in this order: demo/customers.csv (customers), demo/invoices.csv (invoices, source generic), demo/bank_day1.csv and demo/bank_day2.csv (bank); then match and draft (as of today: the demo's dates move to today when it is loaded)."},
         "source": {"type": "string", "enum": list(INVOICE_SOURCES), "description": "Invoice export format (default generic)"},
         "default_currency": {"type": "string", "description": "Currency for rows without one (default: the currency setting, EUR unless changed)"},
-        "date_order": {"type": "string", "enum": ["auto", "dmy", "mdy"], "description": "How to read slashed dates (default auto)"},
+        "date_order": {"type": "string", "enum": ["auto", "dmy", "mdy"], "description": "How to read slashed dates. Default auto: decided from the whole file; a file whose dates all read both ways is refused until you say dmy (day first) or mdy (month first)."},
         "allow_errors": {"type": "boolean", "description": "Import the good rows even when some rows have errors (default false)"},
+        "open_list": {"type": "boolean", "description": "kind=invoices only: true when this export lists EVERY open invoice of its source (e.g. Xero 'Awaiting payment', QuickBooks 'Open invoices'). Invoices from the same source that it no longer lists are held as 'not in the latest export' instead of being chased. Ask the person if unsure (default false)."},
     },
     ["kind", "path"],
 )
@@ -100,8 +103,9 @@ MATCH_SCHEMA = _schema(
 DRAFT_SCHEMA = _schema(
     "cashdesk_draft",
     "Plan today's follow-ups from the ledger and store them as pending drafts: reminders at 7, 14, 21 and 28 "
-    "days overdue in the customer's language, thank-you notes for payments received, and an internal "
-    "escalation note past 30 days. Customers on hold or in dispute get nothing. Every draft waits for a "
+    "days overdue in the customer's language (an older backlog invoice starts at the 28-day reminder), thank-you "
+    "notes for payments received, and an internal escalation note a week after an unanswered 28-day reminder. "
+    "Customers on hold or in dispute get nothing. Every draft waits for a "
     "person's approval; nothing is sent.",
     {"as_of": AS_OF, "sender": {"type": "string", "description": "Business name that signs the drafts (default: the sender_name setting)"}},
 )
@@ -126,9 +130,13 @@ REVISE_SCHEMA = _schema(
 )
 REPLY_SCHEMA = _schema(
     "cashdesk_reply",
-    "Classify a customer's reply as dispute, paid, promise or other. A dispute puts the customer on hold so "
-    "no reminder goes out until a person releases them.",
-    {"customer_id": {"type": "string"}, "text": {"type": "string"}, "lang": {"type": "string", "enum": list(LANGS)}},
+    "Record a customer's reply as dispute, paid, promise or other (pass kind with your own reading; a keyword "
+    "classifier is only the fallback). A dispute puts the customer on hold until a person releases them; a "
+    "promise with a date pauses their reminders until two days after it; paid changes nothing until the bank "
+    "statement shows the money.",
+    {"customer_id": {"type": "string"}, "text": {"type": "string"}, "lang": {"type": "string", "enum": list(LANGS)},
+     "kind": {"type": "string", "enum": ["dispute", "paid", "promise", "other"], "description": "Your reading of the reply (better than the keyword fallback): dispute = they contest the invoice or the amount; paid = they say they already paid; promise = they promise to pay by a date; other = anything else (a question, a request to resend the invoice)"},
+     "promised_date": {"type": "string", "description": "kind=promise: the date they promised, YYYY-MM-DD. No reminder goes to them until two days after it."}},
     ["customer_id", "text"],
 )
 HOLD_SCHEMA = _schema(
@@ -286,6 +294,9 @@ def handle_status(args: dict[str, Any], **_kw: Any) -> str:
         return _error("status failed", exc)
 
 
+_RECENT_BRIEFS: list[str] = []  # the last briefs this process made: the reply check lets the agent quote them
+
+
 def handle_brief(args: dict[str, Any], **_kw: Any) -> str:
     lang = _lang(args.get("lang"))
     try:
@@ -298,6 +309,8 @@ def handle_brief(args: dict[str, Any], **_kw: Any) -> str:
                 if store.list_imports():
                     text = engine.morning_brief(store, as_of, lang)
                     store.record_brief()
+                    _RECENT_BRIEFS.append(text)
+                    del _RECENT_BRIEFS[:-5]
                 else:
                     text = EMPTY_LEDGER[lang].format(as_of=as_of.isoformat())
             finally:
@@ -350,7 +363,8 @@ def handle_import(args: dict[str, Any], **_kw: Any) -> str:
 
     setting = chosen_currency(str(_config("currency", "") or ""))
     currency = str(args.get("default_currency") or setting).strip().upper()
-    date_order = str(args.get("date_order") or "auto").strip().lower()
+    date_order = str(args.get("date_order") or _config("date_order", "") or "auto").strip().lower()
+    open_list = bool(args.get("open_list"))
     allow_errors = bool(args.get("allow_errors"))
     engine, store = _engine(), _store()
     if engine is None or store is None:
@@ -368,15 +382,22 @@ def handle_import(args: dict[str, Any], **_kw: Any) -> str:
         if result.errors and not allow_errors:
             return _fail(f"the file has {len(result.errors)} row error(s); fix it or pass allow_errors=true",
                          kind=kind, rows=result.rows, errors=errors[:50])
-        counts = store.ingest(result, allow_errors=allow_errors, file_name=path.name)
+        counts = store.ingest(result, allow_errors=allow_errors, file_name=path.name, open_list=open_list and kind == "invoices")
     except engine.DuplicateImportError as exc:
         return _fail(f"already imported: {exc}", duplicate=True)
     except Exception as exc:
         return _error("import failed", exc)
     finally:
         _close(store)
+    skipped_by_reason: dict[str, int] = {}
+    for row in result.skipped:
+        skipped_by_reason[row.message] = skipped_by_reason.get(row.message, 0) + 1
     return _json({"ok": True, "kind": kind, "source": result.source, "file": path.name, "rows": result.rows,
-                  "imported": counts, "skipped": len(result.skipped), "errors": errors, "fingerprint": result.fingerprint[:12]})
+                  "imported": counts, "skipped": len(result.skipped), "skipped_by_reason": skipped_by_reason,
+                  "credit_notes": len(getattr(result, "credit_notes", ()) or ()),
+                  "warnings": [{"row": w.row, "message": w.message} for w in (getattr(result, "warnings", ()) or ())][:50],
+                  "date_order": getattr(result, "date_order", None),
+                  "errors": errors, "fingerprint": result.fingerprint[:12]})
 
 
 def handle_match(args: dict[str, Any], **_kw: Any) -> str:
@@ -415,18 +436,49 @@ def handle_draft(args: dict[str, Any], **_kw: Any) -> str:
     try:
         as_of = _as_of(args.get("as_of"))
         invoices, customers = store.list_invoices(), store.list_customers()
+        superseded = []
+        for stale, why in store.stale_drafts():
+            if stale.status != "sent":
+                store.reject_draft(stale.id, f"superseded: {why}")
+                superseded.append({"draft_id": stale.id, "reason": why})
         review = _match_result(store, engine, as_of)
         credit_notes = {number: item.detail for item in review.credit_notes for number in item.named}
+        holds = dict(review.held_invoices)
+        for number, file in store.missing_from_export().items():
+            holds.setdefault(number, f"not_in_export: not in the latest open-invoice export ({file}); it may have been paid. "
+                                     "Check before chasing; it is chased again if a later export lists it")
+        snoozed = store.snoozed(as_of)
+        small = _small_balance()
+        for inv in invoices:
+            if inv.customer_id in snoozed and inv.is_open:
+                until, why = snoozed[inv.customer_id]
+                holds.setdefault(inv.number, f"promise: promised to pay by {until.isoformat()}" + (f" ({why})" if why else "")
+                                 + "; no reminder until two days after that")
+            elif inv.is_open and 0 < inv.balance < small:
+                holds.setdefault(inv.number, f"small_balance: only {engine.format_money(inv.balance, inv.currency)} is open "
+                                             f"(under the ignore_balances_below setting); write it off or chase it by hand")
         plan = engine.plan_followups(invoices, customers, store.list_matches(), store.chase_state(), as_of,
-                                     sender=sender, credit_notes=credit_notes, holds=review.held_invoices)
+                                     sender=sender, credit_notes=credit_notes, holds=holds,
+                                     reminders_sent=store.reminders_sent())
         created = store.create_drafts(plan.all_drafts)
         store.save_chase_state(plan.state)
+        reminder_kinds = ("stage07", "stage14", "stage21", "stage28")
+        new_ids = {d.id for d in plan.all_drafts}
+        for newer in plan.all_drafts:
+            if newer.kind not in reminder_kinds:
+                continue
+            for older in store.list_drafts(customer_id=newer.customer_id):
+                if (older.id not in new_ids and older.kind in reminder_kinds and older.status in ("pending", "approved", "held")
+                        and set(older.invoice_numbers) & set(newer.invoice_numbers)):
+                    store.reject_draft(older.id, f"superseded by {newer.id}", reset_stage=False)
+                    superseded.append({"draft_id": older.id, "reason": f"replaced by the newer reminder {newer.id}"})
         return _json({
             "ok": True, "as_of": as_of.isoformat(), "created": created,
             "drafts": [_draft_dict(store, d) for d in plan.all_drafts],
             "held": [{"customer_id": h.customer_id, "invoice_numbers": list(h.invoice_numbers), "reason": h.reason, "detail": h.detail} for h in plan.held],
             "not_due": list(plan.not_due), "voided": list(plan.voided),
             "already_drafted": [list(x) for x in plan.already_drafted],
+            "superseded": superseded,
             "message": "Drafts wait in the approval queue (cashdesk_queue, the Desktop page or /cashdesk queue). Nothing was sent.",
         })
     except Exception as exc:
@@ -487,20 +539,32 @@ def handle_reply(args: dict[str, Any], **_kw: Any) -> str:
         return _fail("the Cash Desk engine is not available")
     try:
         store.get_customer(customer_id)
-        label = engine.classify_reply(text, _lang(args.get("lang")))
+        given = str(args.get("kind") or "").strip().lower()
+        label = given if given in ("dispute", "paid", "promise", "other") else engine.classify_reply(text, _lang(args.get("lang")))
         held = False
+        snoozed_until = None
         if label == "dispute":
             store.set_hold(customer_id, f"dispute raised in a reply: {text.strip()[:120]}")
             held = True
         else:
-            store.log_event("reply", customer_id, {"class": label, "text": text.strip()[:500]})
+            store.log_event("reply", customer_id, {"class": label, "text": text.strip()[:500], "by": "model" if given else "keywords"})
+        if label == "promise" and args.get("promised_date"):
+            try:
+                snoozed_until = date.fromisoformat(str(args.get("promised_date")).strip())
+            except ValueError:
+                return _fail("promised_date must be YYYY-MM-DD")
+            if snoozed_until > _as_of(None) + timedelta(days=90):
+                return _fail("a promise more than 90 days ahead is not a pause Cash Desk sets on its own; put the customer on hold instead")
+            store.snooze(customer_id, snoozed_until, text.strip()[:120])
         advice = {
             "dispute": "Customer put on hold; their drafts are held until a person releases them with /cashdesk release.",
             "paid": "Import the next bank statement and run cashdesk_match before drafting again.",
-            "promise": "Noted in the ledger's events; the next reminder stage still follows the due dates.",
+            "promise": ("No reminder goes to them until two days after the promised date; then the stages continue."
+                        if snoozed_until else "Noted; pass promised_date to pause their reminders until then."),
             "other": "Noted; no change to the ledger.",
         }[label]
-        return _json({"ok": True, "customer_id": customer_id, "classification": label, "held": held, "advice": advice})
+        return _json({"ok": True, "customer_id": customer_id, "classification": label, "held": held,
+                      "paused_until": snoozed_until.isoformat() if snoozed_until else None, "advice": advice})
     except engine.NotFoundError as exc:
         return _fail(str(exc))
     except Exception as exc:
@@ -552,6 +616,9 @@ def handle_send(args: dict[str, Any], **_kw: Any) -> str:
         return _fail("Cash Desk never sends from a scheduled run or an unknown run context")
     if _host_approvals_off():
         return _fail("Hermes approvals are switched off in this profile; Cash Desk never sends without a human gate")
+    weakened = _host_gate_weakened()
+    if weakened:
+        return _fail(f"Cash Desk will not send: {weakened}")
     engine, store = _engine(), _store()
     if engine is None or store is None:
         return _fail("the Cash Desk engine is not available")
@@ -619,6 +686,39 @@ def _in_scheduled_run() -> bool | None:
         return probe() is not None
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("cash-desk: current_cron_execution() failed: %s", exc)
+        return None
+
+
+def _host_gate_weakened() -> str | None:
+    """Why Hermes's approval prompt would pass a send without a person, or None.
+
+    Hermes auto-approves an escalated tool call with approvals.mode off, with HERMES_YOLO_MODE
+    (``hermes chat --yolo``), and in single-query, cron or unattended-platform runs whose
+    approvals.*_mode is "approve". Cash Desk refuses to send in all of them. A per-session
+    ``/yolo`` toggle is not visible to plugins; the README says so."""
+    if str(os.environ.get("HERMES_YOLO_MODE", "")).strip().lower() in ("1", "true", "yes", "on"):
+        return "Hermes runs in yolo mode (HERMES_YOLO_MODE), which skips its approval prompt"
+    approvals = _host_approvals() or {}
+    if str(approvals.get("mode", "manual")).strip().lower() == "off":
+        return "Hermes approvals are switched off in this profile (approvals.mode: off)"
+    for key in ("single_query_mode", "cron_mode", "unattended_mode"):
+        if str(approvals.get(key, "deny")).strip().lower() == "approve":
+            return f"approvals.{key} is \"approve\", which lets Hermes pass its prompt with nobody there"
+    return None
+
+
+def _host_approvals() -> dict[str, Any] | None:
+    try:
+        from hermes_cli.config import load_config_readonly as _load  # documented plugin-side read
+    except Exception:
+        try:
+            from hermes_cli.config import load_config as _load
+        except Exception:
+            return None
+    try:
+        value = (_load() or {}).get("approvals", {})
+        return value if isinstance(value, dict) else {}
+    except Exception:  # pragma: no cover - defensive
         return None
 
 
@@ -695,17 +795,45 @@ def gate_tool_call(tool_name: str, args: dict[str, Any], task_id: str = "", sess
         return _block(f"Cash Desk never runs {tool_name} inside a delegated subagent; ask in the main conversation.")
     if tool_name != SEND_TOOL:
         return None
-    if _host_approvals_off():
-        return _block("Hermes approvals are switched off in this profile (approvals.mode: off). "
-                      "Cash Desk never sends without a human gate; set approvals.mode to manual or smart.")
+    weakened = _host_gate_weakened()
+    if weakened:
+        if "approvals.mode: off" in weakened:
+            return _block("Hermes approvals are switched off in this profile (approvals.mode: off). "
+                          "Cash Desk never sends without a human gate; set approvals.mode to manual or smart.")
+        return _block(f"Cash Desk will not send: {weakened}. It never sends without a person answering Hermes's prompt.")
     draft_hash = str((args or {}).get("draft_hash") or "").strip()
     if not draft_hash:
         return _block("cashdesk_send needs the draft_hash of an approved draft.")
     return {
         "action": "approve",
-        "message": "Cash Desk wants to send a reminder a person approved. Check the queue once more before allowing it.",
+        "message": _send_prompt(str((args or {}).get("draft_id") or "").strip(), draft_hash),
         "rule_key": f"cashdesk:send:{draft_hash}",
     }
+
+
+def _send_prompt(draft_id: str, draft_hash: str) -> str:
+    """What Hermes's approval prompt says: which reminder, to whom, for how much, which text."""
+    generic = "Cash Desk wants to send a reminder a person approved. Check the queue once more before allowing it."
+    engine, store = _engine(), _store()
+    if engine is None or store is None or not draft_id:
+        _close(store)
+        return generic
+    try:
+        draft = store.get_draft(draft_id)
+        customer = _draft_dict(store, draft)["customer"]
+        label = engine.stage_label(draft.kind, "en")
+        amounts = sorted({f.raw or f.canonical for f in draft.figures if f.kind == "money"}, key=len)
+        last = next((f for f in reversed(draft.figures) if f.kind == "money"), None)
+        total = engine.format_money(last.amount, last.currency, "en") if last is not None and last.currency else ""
+        to = ", ".join(draft.recipients) or "no recipient"
+        same = "" if draft.hash.startswith(draft_hash[:12]) else " WARNING: this hash is not the stored draft's; the send will be refused."
+        return (f"Cash Desk: send {label} to {customer} <{to}>, subject \"{draft.subject}\""
+                f"{(', total ' + total) if total else ''}, text hash {draft.hash[:12]}.{same} "
+                "A person approved this exact text; allow only if it should go out now.")
+    except Exception:
+        return generic
+    finally:
+        _close(store)
 
 
 # --- the slash command (human-only actions) --------------------------------------------------------------
@@ -737,14 +865,17 @@ def handle_command(raw_args: str = "", **_kw: Any) -> str:
                 customer = _draft_dict(store, d)["customer"]
                 label = engine.stage_label(d.kind, "en") if engine else d.kind
                 lines.append(f"  {label} · {customer} · {d.subject}\n    id {d.id} · hash {d.hash[:12]}")
-            lines.append("Approve one with /cashdesk approve <draft-id> [hash-prefix] after reading it (cashdesk_queue shows the text).")
+            lines.append("Approve one with /cashdesk approve <draft-id> <hash-prefix> after reading it (cashdesk_queue shows the text).")
             return "\n".join(lines)
         if verb in ("approve", "reject") and len(parts) < 2:
-            return f"Usage: /cashdesk {verb} <draft-id>" + (" [hash-prefix]" if verb == "approve" else " [reason]")
+            return f"Usage: /cashdesk {verb} <draft-id>" + (" <hash-prefix>" if verb == "approve" else " [reason]")
         if verb == "approve":
             draft = store.get_draft(parts[1])
             prefix = parts[2] if len(parts) > 2 else ""
-            if prefix and not draft.hash.startswith(prefix.lower()):
+            if len(prefix) < 6:
+                return (f"Refused: add the first characters of the hash you read, e.g. /cashdesk approve {draft.id} {draft.hash[:8]} "
+                        "(cashdesk_queue and /cashdesk queue show it), so the approval is for the text you saw.")
+            if not draft.hash.startswith(prefix.lower()):
                 return f"Refused: {draft.id} now has hash {draft.hash[:12]}, not {prefix}. Re-read the draft before approving."
             store.approve_draft(draft.id, draft.hash, approved_by="slash-command")
             customer = _draft_dict(store, draft)["customer"]
@@ -753,6 +884,38 @@ def handle_command(raw_args: str = "", **_kw: Any) -> str:
         if verb == "reject":
             store.reject_draft(parts[1], " ".join(parts[2:]) or "rejected by the reviewer")
             return f"Rejected {parts[1]}. Draft again later with cashdesk_draft if needed."
+        if verb == "review":
+            result = _match_result(store, engine, _as_of(None))
+            items = [*result.review, *result.unmatched]
+            if not items:
+                return "Cash Desk: no payments are waiting for a person."
+            lines = [f"{len(items)} payment(s) waiting for a person (nothing here is applied):"]
+            for item in items:
+                p = item.payment
+                lines.append(f"  {p.id} · {p.date.isoformat()} · {engine.format_money(p.amount, p.currency)} from {p.counterparty or 'unknown payer'} · {item.kind}: {item.detail}")
+                for c in item.candidates[:3]:
+                    lines.append(f"    closest: {c.invoice_number} ({engine.format_money(c.balance, c.currency)} open)")
+            lines.append("Apply one with /cashdesk apply <payment-id> <invoice> [amount], or /cashdesk dismiss <payment-id> [reason].")
+            return "\n".join(lines)
+        if verb == "apply":
+            if len(parts) < 3:
+                return "Usage: /cashdesk apply <payment-id> <invoice> [amount]"
+            amount = None
+            if len(parts) > 3:
+                parsed = engine.parse_amount(parts[3], "en")
+                if parsed is None:
+                    return f"Refused: {parts[3]!r} is not an amount."
+                amount = parsed.value
+            match = store.apply_by_person(parts[1], parts[2], amount, by="slash-command")
+            inv = store.get_invoice(parts[2])
+            left = "paid in full" if inv.status == "paid" else f"{engine.format_money(inv.balance, inv.currency)} still open"
+            return (f"Applied {engine.format_money(match.amount, match.currency)} of {parts[1]} to {parts[2]}: {left}. "
+                    "Reminders that stated the old amount are now stale and are redrafted on the next cashdesk_draft.")
+        if verb == "dismiss":
+            if len(parts) < 2:
+                return "Usage: /cashdesk dismiss <payment-id> [reason]"
+            store.dismiss_payment(parts[1], " ".join(parts[2:]) or "dismissed by the reviewer")
+            return f"Dismissed {parts[1]}: it no longer waits for review and pays no invoice."
         if verb in ("hold", "release") and len(parts) < 2:
             return f"Usage: /cashdesk {verb} <customer-id>" + (" [reason]" if verb == "hold" else "")
         if verb == "hold":
@@ -785,6 +948,16 @@ TOOLS: tuple[tuple[str, dict[str, Any], Any, str, str], ...] = (
     (SEND_TOOL, SEND_SCHEMA, handle_send, "Send one approved draft (gated)", "📤"),
 )
 TOOL_NAMES = tuple(t[0] for t in TOOLS)
+
+
+def _small_balance() -> Any:
+    """Open balances under this are not chased automatically (bank fees, rounding). Default 10.00."""
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        return Decimal(str(_config("ignore_balances_below", "10.00") or "0"))
+    except (InvalidOperation, ValueError):
+        return Decimal("10.00")
 
 
 def _register_blueprint(ctx: Any) -> None:
@@ -824,8 +997,8 @@ def _register_command(ctx: Any) -> None:
         return
     try:
         register("cashdesk", handle_command,
-                 description="Cash Desk: status, queue, approve, reject, hold, release (human-only actions)",
-                 args_hint="status | queue | approve <draft-id> [hash-prefix] | reject <draft-id> | hold <customer-id> | release <customer-id>")
+                 description="Cash Desk: status, queue, approve, reject, hold, release, review, apply, dismiss (human-only actions)",
+                 args_hint="status | queue | approve <draft-id> <hash-prefix> | reject <draft-id> | hold <customer-id> | release <customer-id> | review | apply <payment-id> <invoice> [amount] | dismiss <payment-id>")
     except Exception as exc:
         logger.warning("cash-desk: /cashdesk not registered: %s", exc)
 
@@ -859,6 +1032,11 @@ def guard_reply(response_text: str = "", **_kw: Any) -> str | None:
             raise RuntimeError("the ledger is not available")
         customers = store.list_customers()
         invoices = store.list_invoices()
+        payments = store.list_payments()
+        try:  # what the brief and the status say are ledger figures too (totals, buckets, payments in review)
+            ledger_text = engine.morning_brief(store, _as_of(None), "en")
+        except Exception:  # pragma: no cover - defensive
+            ledger_text = ""
     except Exception as exc:
         if _INVOICE_NO_HINT.search(text):
             logger.warning("cash-desk: reply guard could not read the ledger: %s", exc)
@@ -886,6 +1064,16 @@ def guard_reply(response_text: str = "", **_kw: Any) -> str | None:
             key = (inv.customer_id, inv.currency)
             totals[key] = totals.get(key, 0) + inv.balance
     extra = [engine.Figure.money(amount, cur) for (_cid, cur), amount in totals.items()]
+    names_of = {c.id: c.name for c in customers}
+    for p in payments:
+        # a payment's own amount and id (B1-02, EUR 700.00) are facts from the bank file: allowed in a summary,
+        # or in a reply about the one customer whose name fits the payer
+        if len(named) != 1 or engine.payer_fits(names_of.get(next(iter(named)), ""), p.counterparty):
+            extra.append(engine.Figure.money(abs(p.amount), p.currency))
+            extra.extend(engine.extract_figures(p.id, "en"))
+    if len(named) > 1:  # a summary across customers (the morning brief): its totals and buckets are ledger figures
+        for brief in (ledger_text, *_RECENT_BRIEFS):
+            extra.extend(engine.extract_figures(brief, "en"))
     allowed = engine.ledger_figures(scope, extra)
     unknown = engine.unknown_figures(text, lang, allowed)
     if not unknown:

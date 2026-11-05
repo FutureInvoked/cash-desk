@@ -55,17 +55,27 @@ More: [payments waiting for review](docs/screenshots/match-review.png) ·
 
 | Step | What happens | Who decides |
 |---|---|---|
-| Import | `cashdesk_import` reads a customers CSV, an invoice export (generic, Xero, QuickBooks or Stripe) or a bank statement (English or Czech headers). The same file is never imported twice. | the agent, on request |
-| Match | `cashdesk_match` applies a payment only when its reference names exactly one invoice and the amount equals that invoice's balance in the same currency. Everything else goes to a review list with scored candidates. | the engine; a person reviews the rest |
-| Draft | `cashdesk_draft` plans today's follow-ups: reminders at 7, 14, 21 and 28 days overdue in the customer's language, thank-you notes for payments received, an internal escalation note past 30 days. Customers on hold or in dispute get nothing. | the engine, from the ledger |
-| Reword | `cashdesk_revise` lets the model change the wording. Figure Lock checks every figure against the ledger and rejects anything added, changed or missing, with a diff. | the model proposes, the ledger decides |
-| Approve | A person reads the exact text and approves it on the Desktop page or with `/cashdesk approve`. The approval is bound to the text's hash. | a person |
-| Send | `cashdesk_send` writes an `.eml` file (default) or sends through your own SMTP server. Hermes's approval gate asks the person once more, with a rule key bound to the same hash. | a person, twice |
+| Import | `cashdesk_import` reads a customers CSV, an invoice export (generic, Xero, QuickBooks or Stripe) or a bank statement. It reads what those exports really contain: Xero's amount due and its one-row-per-line-item layout, Stripe's amount remaining, QuickBooks report title and total rows, credit notes and credit memos (kept, never chased), bank files with separate debit/credit or direction columns and a status column (only booked lines count). Day/month order is decided from the whole file; a file whose dates read both ways is refused until you say `dmy` or `mdy`. A newer export never undoes a payment Cash Desk already applied. The same file is never imported twice. | the agent, on request |
+| Match | `cashdesk_match` applies a payment only when its reference names exactly one invoice, the amount equals that invoice's balance in the same currency, the payer's name fits that customer, and it is not dated before the invoice. Everything else goes to a review list with scored candidates, where a person applies it (all or part) or dismisses it: **Apply** / **Dismiss** on the Desktop page or `/cashdesk apply` / `dismiss`. | the engine; a person places the rest |
+| Draft | `cashdesk_draft` plans today's follow-ups: reminders at 7, 14, 21 and 28 days overdue in the customer's language, thank-you notes for payments received; a reminder never claims an earlier reminder that was not sent, and an invoice still unpaid a week after its 28-day reminder gets an internal escalation note. Customers on hold or in dispute get nothing. | the engine, from the ledger |
+| Reword | `cashdesk_revise` lets the model change the wording. Figure Lock checks every figure against the ledger and rejects anything added, changed or missing, with a diff. A rewording may not add a link, an email address, a percentage, or legal, settlement, interest or suspension terms either. | the model proposes, the ledger decides |
+| Approve | A person reads the exact text and approves it on the Desktop page or with `/cashdesk approve`. The approval is bound to the text's hash, and every invoice's open balance and due date are checked again against the ledger; a reminder that is no longer true is refused and redrafted. | a person |
+| Send | `cashdesk_send` writes an `.eml` file (default) or sends through your own SMTP server. Hermes's approval prompt asks the person once more, naming the reminder, the customer, the recipient, the total and the text hash, with a rule key bound to that hash. Cash Desk refuses to send where Hermes would pass that prompt on its own (approvals off, `--yolo`, or an `approve` setting for single-query, cron or unattended runs). | a person, twice |
 | Brief | `cashdesk_brief` and the morning-brief scheduled job (a ready-made template on Hermes's Scheduled jobs page) report payments applied, newly overdue invoices, drafts waiting and customers on hold. They change nothing except the brief's own "last brief" time, so the next brief starts where this one ended. | nobody has to |
 
-Replies are classified by `cashdesk_reply` (dispute, paid, promise, other); a dispute
-puts the customer on hold. The model may hold a customer (`cashdesk_hold`); only a
-person can release one.
+Replies go through `cashdesk_reply`: the model reads the customer's answer and records it as
+dispute, paid, promise or other (a keyword list is only the fallback). A dispute puts the
+customer on hold; a promise to pay by a date pauses their reminders until two days after
+it; "we already paid" changes nothing until the bank statement shows the money. The
+model may hold a customer (`cashdesk_hold`); only a person can release one.
+
+Weekly use: import each week's exports. A newer export never undoes a payment Cash Desk
+applied; with `open_list: true` (an "Awaiting payment" / "Open invoices" export that lists
+every open invoice), invoices it no longer lists are held as "not in the latest export"
+instead of being chased. A contact list (`Customer, Email, Full Name`, as QuickBooks and
+Xero export it) meets the invoices by name, so reminders get their email addresses. When a
+newer reminder stage is drafted, the older unsent one is replaced, so two reminders for one
+invoice never wait side by side.
 
 ## Try it in ninety seconds
 
@@ -113,6 +123,8 @@ Set them under `plugins.entries.cash-desk.settings` in `config.yaml`
 | `smtp_password` | secret `CASHDESK_SMTP_PASSWORD` | Stored by Hermes and read only through its secret scope. |
 | `eml_outbox` | empty | Folder for `.eml` files; empty means `plugin-data/cash-desk/outbox/`. |
 | `currency` | `EUR` | Three-letter code (`EUR`, `USD`, `GBP`...). Used for files without a currency column and for the bundled demo, which is shown in this currency. Files that name their own currency keep it. |
+| `date_order` | `auto` | How to read slashed dates: `auto` decides from each file and refuses a file whose dates all read both ways; `dmy` (05/11/2026 = 5 November) or `mdy` (= May 11) sets it once for your bank and accounting files. |
+| `ignore_balances_below` | `10.00` | An open balance under this (a bank fee, rounding) gets no automatic reminder; it is listed as held so you can write it off or chase it by hand. `0` chases everything. |
 | `guard_outgoing_messages` | `false` | Figure Lock on the agent's own replies (below). Restart the gateway after changing it. |
 | `import_dirs` | empty | Comma-separated folders `cashdesk_import` may read. The plugin's data folder and its bundled `demo/` are always allowed; any other path is refused before it is opened. |
 
@@ -179,9 +191,16 @@ returns JSON and never raises. Hooks: `pre_tool_call` (the gate on every write a
 `subagent_start` and `subagent_stop` (to keep writes out of subagents) and
 `transform_llm_output` (the opt-in reply check below).
 
-`/cashdesk status | queue | approve <draft-id> [hash-prefix] | reject <draft-id> [reason] | hold <customer-id> [reason] | release <customer-id>`
-is the person's own control. Approving, rejecting and releasing exist only here and
-on the Desktop page; the model has no tool for them.
+`/cashdesk status | queue | approve <draft-id> <hash-prefix> | reject <draft-id> [reason] | hold <customer-id> [reason] | release <customer-id> | review | apply <payment-id> <invoice> [amount] | dismiss <payment-id> [reason]`
+is the person's own control. Approving, rejecting, releasing, and applying or dismissing a
+payment that waits for review exist only here and on the Desktop page; the model has no
+tool for them.
+
+Two limits worth knowing. Hermes keeps a per-session `/yolo` switch in its own private
+state, which a plugin cannot see: if you turn it on, Hermes passes its prompt on its own
+(Cash Desk still requires your approval of the exact text). And the ledger is a SQLite
+file on your machine: whoever can edit that file can edit the approval too, so keep it
+as private as your accounting exports.
 
 **Optional: check the agent's chat replies too** (`guard_outgoing_messages`, off by
 default). When on, a chat reply that quotes a wrong amount, IBAN or invoice number for a
@@ -235,13 +254,20 @@ Each row is a real message from the plugin and the test that checks it; a test
 | Drafting before the business name is set | `set sender_name in the plugin settings` | `test_draft_needs_a_sender` |
 | With `guard_outgoing_messages` on, a reply names a customer but states an amount, IBAN or invoice number the ledger does not hold for them | `Cash Desk withheld this reply` | `test_a_wrong_amount_for_that_customer_is_withheld` |
 | **Load demo data** on a ledger that already holds data | `the ledger is not empty` | `test_load_demo_refuses_a_ledger_that_already_has_data` |
+| A payment names an invoice but comes from someone else (another payer's name) | `check who paid before applying` | `test_a_payment_from_someone_else_is_not_applied_automatically` |
+| A payment is dated before the invoice it names was issued | `check the dates before applying` | `test_a_payment_dated_before_the_invoice_goes_to_review` |
+| Approving or sending a reminder whose invoice balance or due date changed since it was drafted | `not the amount this draft states` | `test_an_approved_reminder_with_an_old_amount_is_refused_and_redrafted` |
+| A rewording adds a link, an email address, a percentage, or a legal, settlement, interest or suspension term | `a rewording may not add` | `test_a_rewording_may_not_add_links_addresses_percentages_or_terms` |
+| A send while Hermes would pass its own prompt with nobody there (`--yolo`, or `approvals.single_query_mode`, `cron_mode` or `unattended_mode` set to `approve`) | `lets Hermes pass its prompt with nobody there` | `test_no_send_where_hermes_would_pass_its_own_prompt` |
+| `/cashdesk apply` (or **Apply** on the page) for more than is left of a payment | `is left to apply` | `test_a_person_applies_or_dismisses_a_payment_waiting_for_review` |
+| `/cashdesk approve` without the first characters of the hash the person read | `add the first characters of the hash you read` | `test_approving_needs_the_hash_the_person_read` |
 <!-- refusals:end -->
 
-**Measured.** In our test on the seven demo reminders, Figure Lock caught **72 of 72**
+**Measured.** In our test on the seven demo drafts, Figure Lock caught **74 of 74**
 deliberate one-digit changes to their figures (16 dates, 16 amounts, 16 invoice numbers, 16 payment references,
-8 IBANs; the first and the last digit of each occurrence, one at a time), each sent
+10 IBANs; the first and the last digit of each occurrence, one at a time), each sent
 through `cashdesk_revise`. Every untouched draft still passed. With the lock switched off
-the same run reports 72 misses, so the count measures the lock, not the test.
+the same run reports 74 misses, so the count measures the lock, not the test.
 `tests/plugin/test_mutations.py` reruns it and fails if these numbers change.
 
 ### From a real run

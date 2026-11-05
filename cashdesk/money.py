@@ -32,8 +32,9 @@ CURRENCY_CS = {"CZK": "Kč"}
 _CUR = r"(?:[A-Za-z]{3}|€|\$|£|Kč|Kc|zł)"
 _WORD = r"(?:euros?|eura|korun[ay]?|korunách|crowns?|dollars?|pounds?)"
 _AMOUNT_RE = re.compile(
-    rf"^(?P<sign1>[-+−])?\s*(?P<cur1>{_CUR})?\s*(?P<sign2>[-+−])?\s*"
-    rf"(?P<num>\d(?:[\d .,'’]*\d)?)(?P<dash>\s*,\s*[-–]|\s*\.\s*[-–])?\s*(?P<cur2>{_WORD}\b|{_CUR})?\.?\s*$",
+    rf"^(?P<open>\()?\s*(?P<sign1>[-+−])?\s*(?P<cur1>{_CUR})?\s*(?P<sign2>[-+−])?\s*"
+    rf"(?P<num>\d(?:[\d .,'’]*\d)?)(?P<dash>\s*,\s*[-–]|\s*\.\s*[-–])?\s*(?P<sign3>[-−])?\s*"
+    rf"(?P<cur2>{_WORD}\b|{_CUR})?\.?\s*(?P<close>\))?\s*$",
     re.IGNORECASE,
 )
 
@@ -63,8 +64,22 @@ def normalise_currency(token: str | None) -> str | None:
     return None
 
 
-def _digits(num: str, lang: str | None) -> Decimal | None:
-    """Turn ``1.250,00`` / ``1,250.00`` / ``1 250`` into a Decimal, by language when ambiguous."""
+def _decimal(whole: str, frac: str, strict: bool = False) -> Decimal | None:
+    """``whole.frac`` as a Decimal; with ``strict``, None when more than two decimals are not zeros."""
+    if strict and len(frac.rstrip("0")) > 2:
+        return None
+    return Decimal(f"{whole}.{frac}") if frac else Decimal(whole)
+
+
+def _digits(num: str, lang: str | None, strict: bool = False) -> Decimal | None:
+    """Turn ``1.250,00`` / ``1,250.00`` / ``1 250`` into a Decimal, by language when ambiguous.
+
+    A lone separator before exactly three digits is a thousands separator only
+    when the group before it has one to three digits (``1.250``, ``250,000``)
+    and is not a bare ``0``; after a longer group it is a decimal point
+    (``1250.500`` is 1250.50). With ``strict``, more than two decimals that are
+    not zeros (``1250.505``) are refused rather than rounded.
+    """
     num = num.replace("'", "").replace("’", "").replace(" ", "")
     if not re.fullmatch(r"\d+(?:[.,]\d+)*", num):
         return None
@@ -75,42 +90,41 @@ def _digits(num: str, lang: str | None) -> Decimal | None:
         if num.count(decimal_sep) != 1:
             return None
         whole, frac = num.split(decimal_sep)
-        whole = whole.replace(thousands, "")
-        return Decimal(f"{whole}.{frac}")
+        return _decimal(whole.replace(thousands, ""), frac, strict)
     sep = "." if has_dot else "," if has_comma else None
     if sep is None:
         return Decimal(num)
     parts = num.split(sep)
     if len(parts) > 2:
-        if all(len(p) == 3 for p in parts[1:]):
+        if 1 <= len(parts[0]) <= 3 and all(len(p) == 3 for p in parts[1:]):
             return Decimal("".join(parts))
         return None
     whole, frac = parts
-    if len(frac) == 3 and len(whole) <= 3:
-        # one separator before exactly three digits: thousands or decimal by language
+    if len(frac) == 3 and len(whole) <= 3 and whole != "0" and not whole.startswith("0"):
+        # one separator before exactly three digits after a short group: thousands or decimal by language
         if lang == "cs":
             is_thousands = sep == "."
         elif lang == "en":
             is_thousands = sep == ","
         else:
-            is_thousands = sep == "," or whole != "0"
+            is_thousands = True
         if is_thousands:
             return Decimal(whole + frac)
-        return Decimal(f"{whole}.{frac}")
-    if len(frac) == 3:
-        return Decimal(whole + frac)
-    if len(frac) > 3:
-        return None
-    return Decimal(f"{whole}.{frac}")
+    return _decimal(whole, frac, strict)
 
 
-def parse_amount(text: str, lang: str | None = None) -> Amount | None:
+def parse_amount(text: str, lang: str | None = None, *, strict: bool = False) -> Amount | None:
     """Read one amount out of ``text``; None when it is not an amount.
 
     Handles ``1,250.00``, ``1250.00``, ``€1,250``, ``1 250,00 Kč``, ``1.250,00 €``,
     ``CZK 1 250``, ``12 500,-`` and no-break spaces. A lone separator followed by
-    three digits (``1.250`` / ``1,250``) is decided by ``lang``: English reads a
-    comma as thousands and a dot as decimal, Czech the other way round.
+    three digits after a group of one to three digits (``1.250`` / ``1,250``) is
+    decided by ``lang``: English reads a comma as thousands and a dot as
+    decimal, Czech the other way round; without a language it is thousands.
+    After a longer group it is always a decimal point (``1250.500`` is 1250.50).
+    More decimals round half up to cents, except with ``strict`` (the importers),
+    where more than two non-zero decimals (``1250.505``) are refused. A trailing minus
+    (``1.200,00-``) and accounting parentheses (``(1,200.00)``) are negative.
     """
     if text is None:
         return None
@@ -123,16 +137,20 @@ def parse_amount(text: str, lang: str | None = None) -> Amount | None:
     m = _AMOUNT_RE.match(cleaned)
     if not m:
         return None
-    value = _digits(m.group("num"), lang)
+    value = _digits(m.group("num"), lang, strict)
     if value is None:
         return None
     currency = normalise_currency(m.group("cur1")) or normalise_currency(m.group("cur2"))
     if (m.group("cur1") and currency is None) or (m.group("cur2") and currency is None):
         return None
-    if m.group("sign1") or m.group("sign2"):
-        sign = (m.group("sign1") or "") + (m.group("sign2") or "")
-        if sign.count("-") + sign.count("−") == 1:
-            value = -value
+    if bool(m.group("open")) != bool(m.group("close")):
+        return None
+    sign = (m.group("sign1") or "") + (m.group("sign2") or "") + (m.group("sign3") or "")
+    minuses = sign.count("-") + sign.count("−")
+    if minuses > 1 or (minuses and m.group("open")):
+        return None
+    if minuses == 1 or m.group("open"):
+        value = -value
     try:
         return Amount(value.quantize(_CENTS, rounding=ROUND_HALF_UP), currency)
     except InvalidOperation:

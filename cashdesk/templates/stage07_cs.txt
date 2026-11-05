@@ -1,4 +1,4 @@
-Předmět: Přátelská připomínka platby ({total})
+Předmět: Připomínka: {overdue_summary} ({total})
 
 Dobrý den,
 

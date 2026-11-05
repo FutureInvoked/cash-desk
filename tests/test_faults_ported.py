@@ -63,10 +63,11 @@ def test_F1_F48_stage_wording_claims_only_the_oldest_invoice_is_late():
         en, cs = load_template(kind, "en"), load_template(kind, "cs")
         assert "{oldest_is}" in en and "are now more than 30 days overdue" not in en  # "The oldest is" / "It is"
         assert "nejstarší položka" in cs.lower() and "které jsou více než 30 dní" not in cs
-    # 31+ days is an escalation in the engine, so the strongest customer-facing wording is stage 28
+    # stage 28 is the strongest customer-facing wording; it states the real age of the oldest invoice
     p = plan([inv("T-1", "acme", "2026-09-27", "1200"), inv("T-2", "acme", "2026-10-19", "450")], [cust("acme", "Acme Test Studio")])
     body = drafts_by_customer(p)["acme"].body
-    assert "The oldest is now four weeks" in body and "(28 days overdue)" in body and "(6 days overdue)" in body
+    assert "The oldest is now 28 days past its due date" in body and "(28 days overdue)" in body and "(6 days overdue)" in body
+    assert "earlier reminders" not in body, "a first contact claims no reminder history"
 
 
 def test_F2_a_czk_invoice_is_labelled_czk_never_eur():
@@ -172,12 +173,13 @@ def test_F49_F50_B9_a_void_invoice_is_never_chased_and_a_payment_naming_it_is_qu
     assert result.applied == () and result.review[0].kind == "VOID"
 
 
-def test_F51_F52_B9_no_draft_without_an_email_or_contact_name_both_listed():
+def test_F51_F52_B9_no_draft_without_an_email_listed_no_contact_name_greets_hello():
     ledger = [inv("FI-6", "nomail", "2026-10-10", "100"), inv("FI-7", "noname", "2026-10-10", "100"), inv("FI-8", "ok", "2026-10-10", "100")]
     p = plan(ledger, [cust("nomail", "NoMail Test Ltd", email=""), cust("noname", "NoName Test Ltd", contact=""), cust("ok", "Fine Ltd")])
-    assert set(drafts_by_customer(p)) == {"ok"}
+    assert set(drafts_by_customer(p)) == {"noname", "ok"}
+    assert drafts_by_customer(p)["noname"].body.startswith("Hello,\n")
     reasons = {h.customer_id: h.reason for h in p.held}
-    assert reasons == {"nomail": "no_email", "noname": "no_contact_name"}
+    assert reasons == {"nomail": "no_email"}
 
 
 def test_F53_a_bank_line_dated_after_as_of_is_queued_not_applied():
@@ -320,7 +322,8 @@ def test_B9_escalation_has_the_amount_the_days_and_the_stages_drafted():
     state = ChaseState({"GA-106": "stage28"})
     p = plan(ledger, [cust("fir", "Fir Example GmbH")], state=state)
     (esc,) = p.escalations
-    assert p.drafts == () and "EUR 2,900.00" in esc.subject and "45 days overdue" in esc.body and "GA-106: reminder 28" in esc.body
+    assert "EUR 2,900.00" in esc.subject and "45 days overdue" in esc.body and "GA-106: reminder 28" in esc.body
+    assert [(d.kind, d.invoice_numbers) for d in p.drafts] == [("stage07", ("GA-107",))], "the escalated invoice is left to the reviewer; the newer one keeps its own schedule"
 
 
 def test_B9_state_prevents_a_second_draft_and_a_week_later_the_next_stage_follows():

@@ -177,7 +177,7 @@ def test_reply_classification_holds_disputes(plugin):
     held = ctx.call("cashdesk_queue", status="held")["drafts"]
     assert any(d["id"] == draft["id"] for d in held)
     # A held customer cannot be approved; a person must release first.
-    assert ctx.command(f"approve {draft['id']}").startswith("Refused")
+    assert ctx.command(f"approve {draft['id']} {draft['hash'][:8]}").startswith("Refused")
     assert "released" in ctx.command(f"release {draft['customer_id']}")
     assert ctx.call("cashdesk_queue")["count"] >= 1
     assert ctx.call("cashdesk_reply", customer_id="nobody", text="paid")["ok"] is False
@@ -255,7 +255,7 @@ def test_send_requires_an_approval_of_the_exact_text_and_writes_once(plugin, her
     draft = demo_stage14(ctx)
     refused = ctx.call("cashdesk_send", draft_id=draft["id"], draft_hash=draft["hash"])
     assert refused["ok"] is False and "no approval covers this exact text" in refused["error"]
-    assert ctx.command(f"approve {draft['id']}").startswith("Approved")
+    assert ctx.command(f"approve {draft['id']} {draft['hash'][:8]}").startswith("Approved")
     wrong_hash = ctx.call("cashdesk_send", draft_id=draft["id"], draft_hash="0" * 64)
     assert wrong_hash["ok"] is False
     sent = ctx.call("cashdesk_send", draft_id=draft["id"], draft_hash=draft["hash"])
@@ -272,7 +272,7 @@ def test_send_requires_an_approval_of_the_exact_text_and_writes_once(plugin, her
     assert ctx.call("cashdesk_queue", status="sent")["count"] == 1
     # A revision after approval drops the approval: the old hash no longer sends.
     other = next(d for d in ctx.call("cashdesk_queue")["drafts"] if d["kind"] == "stage07")
-    assert ctx.command(f"approve {other['id']}").startswith("Approved")
+    assert ctx.command(f"approve {other['id']} {other['hash'][:8]}").startswith("Approved")
     revised = ctx.call("cashdesk_revise", draft_id=other["id"], new_text=other["body"] + "\n\nKind regards.")
     assert revised["ok"]
     for stale_or_unapproved in (other["hash"], revised["draft"]["hash"]):
@@ -304,7 +304,7 @@ def test_send_refuses_a_draft_edited_in_the_ledger_after_approval(plugin, hermes
     load_demo(ctx)
     ctx.call("cashdesk_draft", as_of=AS_OF)
     draft = demo_stage14(ctx)
-    assert ctx.command(f"approve {draft['id']}").startswith("Approved")
+    assert ctx.command(f"approve {draft['id']} {draft['hash'][:8]}").startswith("Approved")
     db = hermes_fakes / "plugin-data" / "cash-desk" / "cashdesk.sqlite"
     with sqlite3.connect(db) as conn:
         changed = conn.execute("UPDATE drafts SET body = body || ? WHERE id = ?",
@@ -321,7 +321,7 @@ def test_send_needs_a_from_address_and_never_runs_scheduled(plugin):
     load_demo(ctx)
     ctx.call("cashdesk_draft", as_of=AS_OF)
     draft = demo_stage14(ctx)
-    ctx.command(f"approve {draft['id']}")
+    ctx.command(f"approve {draft['id']} {draft['hash'][:8]}")
     ctx.config["smtp_from"] = ""
     assert "set the From address (smtp_from)" in ctx.call("cashdesk_send", draft_id=draft["id"], draft_hash=draft["hash"])["error"]
     ctx.config["smtp_from"] = "billing@example.invalid"
@@ -363,7 +363,7 @@ def test_one_version_everywhere():
 
     version = manifest()["version"]
     newest = _re.search(r"^## (\d+\.\d+\.\d+)", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), _re.M).group(1)
-    assert version == newest == "1.0.0", (version, newest)
+    assert version == newest == "1.1.0", (version, newest)
     draft = ROOT / "docs" / "catalog-entry.draft.yaml"
     if draft.exists():
         catalog = yaml.safe_load(draft.read_text(encoding="utf-8"))

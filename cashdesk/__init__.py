@@ -54,6 +54,7 @@ from .matching import (
     invoices_named,
     is_refund,
     match_payments,
+    payer_fits,
     name_similarity,
     normalise_name,
 )
@@ -119,7 +120,7 @@ __all__ = [
     "read_invoices", "read_bank_csv", "read_customers",
     # matching
     "NAME_MIN", "REVIEW_KINDS", "Candidate", "ReviewItem", "MatchResult",
-    "normalise_name", "name_similarity", "is_refund", "invoices_named", "match_payments",
+    "normalise_name", "name_similarity", "is_refund", "invoices_named", "match_payments", "payer_fits",
     # chasing
     "STAGES", "ESCALATE_AFTER", "stage_for", "ChaseState", "Reply", "classify_reply", "HeldItem", "FollowupPlan", "plan_followups",
     # render

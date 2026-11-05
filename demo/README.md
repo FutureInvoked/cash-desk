@@ -28,8 +28,10 @@ dates as written; use `as_of=2026-11-10` there.
 - **Reminder 21**: Greenhill Outfitters Ltd, INV-2026-0036, EUR 4,840.00.
 - **Reminder 28**: Birchfield Example Consulting GmbH, INV-2026-0031 at 28
   days plus INV-2026-0044 at 10 days: one draft listing both.
-- **Escalation** (past 30 days): Stonebridge Holdings Ltd, INV-2026-0027 at 36
-  days, EUR 12,100.00. An internal note for the reviewer; no reminder.
+- **Reminder 28** (backlog): Stonebridge Holdings Ltd, INV-2026-0027 at 36
+  days, EUR 12,100.00. Cash Desk never wrote to them before, so this first reminder
+  states the real age and claims no earlier reminder. If it is still unpaid a week
+  later, an internal escalation note is drafted for the reviewer.
 - **Void**: INV-2026-0038 (Northgate) is void and never chased.
 - **Dispute**: Oakridge Placeholder Partners LLP has INV-2026-0033 disputed,
   which also holds INV-2026-0040.
