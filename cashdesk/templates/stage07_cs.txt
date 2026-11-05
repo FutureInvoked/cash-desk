@@ -1,0 +1,14 @@
+Předmět: Přátelská připomínka platby ({total})
+
+Dobrý den,
+
+dovolujeme si vás upozornit, že podle našich záznamů je po splatnosti:
+
+{invoice_lines}
+
+{payment_details}
+
+Pokud je platba již na cestě, děkujeme a tuto zprávu prosím považujte za bezpředmětnou. V opačném případě nám prosím dejte vědět, kdy ji můžeme očekávat.
+
+S pozdravem
+{sender}

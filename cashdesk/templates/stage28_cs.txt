@@ -1,0 +1,14 @@
+Předmět: Naléhavé: platba po splatnosti, nejstarší položka čtyři týdny ({total})
+
+Vážená paní, vážený pane,
+
+přes naše předchozí připomínky podle našich záznamů stále zůstává neuhrazeno:
+
+{invoice_lines}
+
+{payment_details}
+
+Nejstarší položka je již čtyři týdny po splatnosti. Prosíme o úhradu nebo o kontakt v nejbližších dnech. Pokud se věc nevyřeší, předáme ji k posouzení odpovědné osobě.
+
+S pozdravem
+{sender}

@@ -1,0 +1,14 @@
+Předmět: Druhá připomínka platby ({total})
+
+Dobrý den,
+
+podle našich záznamů jsme zatím neobdrželi úhradu za:
+
+{invoice_lines}
+
+{payment_details}
+
+Nejstarší položka je již dva týdny po splatnosti. Prosíme o ověření u vaší účtárny a sdělení termínu úhrady. Pokud je na faktuře něco v nepořádku, odpovězte nám prosím a prověříme ji.
+
+S pozdravem
+{sender}

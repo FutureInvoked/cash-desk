@@ -1,0 +1,9 @@
+customer_id,name,language,email,contact_name,on_hold,hold_reason
+C001,Northgate Sample Studio Ltd,en,ann@northgate.example,Ann Example,no,
+C002,Bluebell Design Studio Ltd,en,mia@bluebell.example,Mia Sample,no,
+C003,Greenhill Outfitters Ltd,en,eva@greenhill.example,Eva Example,no,
+C004,Birchfield Example Consulting GmbH,en,klaus@birchfield.example,Klaus Muster,no,
+C005,Stonebridge Holdings Ltd,en,karl@stonebridge.example,Karl Fictive,no,
+C006,Oakridge Placeholder Partners LLP,en,lee@oakridge.example,Lee Placeholder,no,
+C007,Fernhill Test Media Ltd,en,sam@fernhill.example,Sam Demo,no,
+C008,Lindenway Logistics Ltd,en,jane@lindenway.example,Jane Sample,no,

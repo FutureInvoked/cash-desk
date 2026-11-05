@@ -1,0 +1,12 @@
+Předmět: Děkujeme za úhradu ({total})
+
+Dobrý den,
+
+děkujeme, vaši platbu jsme obdrželi:
+
+{invoice_lines}
+
+Vážíme si toho.
+
+S pozdravem
+{sender}

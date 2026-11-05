@@ -1,0 +1,14 @@
+Subject: Urgent: {invoices} {age28} ({total})
+
+Dear {first_name},
+
+Despite our earlier reminders, the {invoice_s} below {is_are} still unpaid. {oldest_is} now four weeks past its due date:
+
+{invoice_lines}
+
+{payment_details}
+
+Please settle the balance or contact us within the next few days. If the matter is not resolved, it will be passed to our account manager for review.
+
+Regards,
+{sender}

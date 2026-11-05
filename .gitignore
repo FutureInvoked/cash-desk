@@ -1,0 +1,16 @@
+# Catalog rule 17: no bytecode or binaries in the repo
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+# Local plugin state and outputs (never committed)
+var/
+*.sqlite
+*.sqlite-journal
+*.db
+*.eml
+.DS_Store
+# Editor and OS noise
+.idea/
+.vscode/

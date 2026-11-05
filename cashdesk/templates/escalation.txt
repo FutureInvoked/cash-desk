@@ -1,0 +1,13 @@
+Subject: Escalation: {customer} - {invoices} more than 30 days overdue ({total})
+
+Internal note for the reviewer. Nothing in this note goes to the customer.
+
+{customer} has invoices more than 30 days past their due date:
+
+{invoice_lines}
+
+Reminder stages drafted so far: {stages}
+
+Decide what happens next: a call, a payment plan, or a hand-over to the account manager. No reminder is drafted for this customer until you decide.
+
+{sender}

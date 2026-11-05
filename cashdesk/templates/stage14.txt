@@ -1,0 +1,14 @@
+Subject: Second reminder: {invoices} overdue ({total})
+
+Hi {first_name},
+
+We have not yet received payment for the {invoice_s} below. {oldest_is} now two weeks past its due date:
+
+{invoice_lines}
+
+{payment_details}
+
+Could you check this with your accounts team and let us know the payment date? If something is wrong with an invoice, please reply so we can look at it.
+
+Kind regards,
+{sender}

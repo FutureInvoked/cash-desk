@@ -1,0 +1,14 @@
+Předmět: Upomínka: platba po splatnosti ({total})
+
+Vážená paní, vážený pane,
+
+podle našich záznamů zůstává neuhrazeno:
+
+{invoice_lines}
+
+{payment_details}
+
+Nejstarší položka je již tři týdny po splatnosti. Prosíme o úhradu během tohoto týdne nebo o sdělení termínu platby. Máte-li k faktuře dotaz, odpovězte nám a prověříme ho.
+
+S pozdravem
+{sender}

@@ -1,0 +1,14 @@
+Subject: Payment overdue: {invoices} ({total})
+
+Dear {first_name},
+
+The {invoice_s} below {remain_s} unpaid. {oldest_is} now three weeks past its due date:
+
+{invoice_lines}
+
+{payment_details}
+
+Please arrange payment this week, or reply with the date it will be made. If you have a question about an invoice, reply and we will review it.
+
+Regards,
+{sender}

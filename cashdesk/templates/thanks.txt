@@ -1,0 +1,12 @@
+Subject: Thank you for your payment ({total})
+
+Hi {first_name},
+
+Thank you, we have received your payment for:
+
+{invoice_lines}
+
+We appreciate it.
+
+Kind regards,
+{sender}

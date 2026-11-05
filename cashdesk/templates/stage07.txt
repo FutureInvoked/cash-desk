@@ -1,0 +1,14 @@
+Subject: Friendly reminder: {invoices} now due ({total})
+
+Hi {first_name},
+
+A quick note that the following {invoice_s} {has_have} passed {its_their} due date:
+
+{invoice_lines}
+
+{payment_details}
+
+If payment is already on its way, thank you and please ignore this message. Otherwise, could you let us know when we can expect it?
+
+Kind regards,
+{sender}

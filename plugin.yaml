@@ -1,0 +1,96 @@
+# Cash Desk: a Hermes plugin that chases overdue invoices.
+# The model writes the words; the ledger owns the numbers.
+name: cash-desk
+version: "1.0.0"
+manifest_version: 2
+api_version: 1
+description: "Chase overdue invoices from CSV exports: match payments to invoices, draft graduated reminders in English and Czech, and send only after a person approves the exact text and Hermes's approval gate asks once more. Figure Lock keeps every amount, invoice number, date, IBAN and reference identical to the ledger."
+author: FutureInvoked
+license: MIT
+homepage: https://futureinvoked.uk/projects/cash-desk/
+tags: [finance, receivables, invoices, reminders, approval, local-only]
+# SemVer floor, kept identical in the catalog entry (rule 14). The plugin uses
+# register_automation_blueprint, current_cron_execution, plugin_data_dir and
+# get_secret, all of which first shipped in Hermes v0.22.5; the reply guard registers
+# transform_llm_output with hold_stream, which first shipped in v0.22.6.
+requires_hermes: ">=0.22.6"
+provides_tools:
+  - cashdesk_status
+  - cashdesk_brief
+  - cashdesk_queue
+  - cashdesk_import
+  - cashdesk_match
+  - cashdesk_draft
+  - cashdesk_revise
+  - cashdesk_reply
+  - cashdesk_hold
+  - cashdesk_send
+provides_hooks:
+  - pre_tool_call
+  - subagent_start
+  - subagent_stop
+  - transform_llm_output
+config_schema:
+  sender_name:
+    type: str
+    default: ""
+    label: "Business name"
+    description: "The business that issued the invoices. It signs every reminder; drafting refuses until it is set."
+  send_mode:
+    type: str
+    choices: [eml, smtp]
+    default: eml
+    label: "Send mode"
+    description: "eml writes each approved reminder as an .eml file for your mail client; smtp sends it through your own SMTP server after approval. Nothing is sent in either mode without an approval."
+  smtp_host:
+    type: str
+    default: ""
+    label: "SMTP host"
+    description: "Only used when send_mode is smtp."
+  smtp_port:
+    type: int
+    default: 587
+    label: "SMTP port"
+  smtp_user:
+    type: str
+    default: ""
+    label: "SMTP user"
+  smtp_ca_file:
+    type: str
+    default: ""
+    label: "SMTP certificate file"
+    description: "Only for a mail server with its own certificate (a company or test server): the PEM file to trust. The server's certificate is always checked; empty means the system's trusted certificates."
+  smtp_from:
+    type: str
+    default: ""
+    label: "From address"
+    description: "The sender address on reminders, in both modes (it is the From header of .eml files too). Replies go here unless reply_to is set."
+  smtp_password:
+    type: secret
+    env: CASHDESK_SMTP_PASSWORD
+    description: "SMTP password. Stored by Hermes, read only through its secret scope, never from .env by the plugin."
+  reply_to:
+    type: str
+    default: ""
+    label: "Reply-To address"
+    description: "Optional. Where customer replies should go when it differs from the sender."
+  eml_outbox:
+    type: str
+    default: ""
+    label: ".eml outbox folder"
+    description: "Where approved reminders are written in eml mode. Empty means the plugin's own data folder (plugin-data/cash-desk/outbox)."
+  currency:
+    type: str
+    default: "EUR"
+    label: "Currency"
+    description: "Three-letter currency code (EUR, USD, GBP...) for files without a currency column and for the bundled demo, which is shown in this currency. Files that name their own currency keep it."
+  guard_outgoing_messages:
+    type: bool
+    default: false
+    label: "Check the agent's replies"
+    description: "Figure Lock on the agent's own replies. When on, a reply that names a ledger customer or quotes an invoice number may only state that customer's ledger amounts, IBANs and invoice numbers; anything else is withheld and replaced with a notice before Hermes stores or delivers it. While on, replies in this profile arrive whole instead of streaming. Restart the gateway after changing it."
+  import_dirs:
+    type: str
+    default: ""
+    label: "Import folders"
+    description: "Comma-separated folders cashdesk_import may read CSV exports from, in addition to the plugin's own data folder and its bundled demo/ folder. Anything else is refused before it is opened."
