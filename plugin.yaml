@@ -1,7 +1,7 @@
 # Cash Desk: a Hermes plugin that chases overdue invoices.
 # The model writes the words; the ledger owns the numbers.
 name: cash-desk
-version: "1.1.0"
+version: "1.2.0"
 manifest_version: 2
 api_version: 1
 description: "Chase overdue invoices from CSV exports: match payments to invoices, draft graduated reminders in English and Czech, and send only after a person approves the exact text and Hermes's approval gate asks once more. Figure Lock keeps every amount, invoice number, date, IBAN and reference identical to the ledger."
@@ -36,6 +36,16 @@ config_schema:
     default: ""
     label: "Business name"
     description: "The business that issued the invoices. It signs every reminder; drafting refuses until it is set."
+  default_language:
+    type: str
+    default: "en"
+    label: "Language for customers without one"
+    description: "en or cs. Used for customers imported from files with no language column (Xero, QuickBooks and Stripe exports have none). A language column always wins."
+  payment_iban:
+    type: str
+    default: ""
+    label: "Your bank account (IBAN)"
+    description: "Printed in reminders for invoices whose export carries no IBAN (Xero, QuickBooks and Stripe exports usually do not). Must be a valid IBAN; Figure Lock then holds it like any ledger figure."
   send_mode:
     type: str
     choices: [eml, smtp]

@@ -26,8 +26,9 @@ dates as written; use `as_of=2026-11-10` there.
 - **Reminder 14**: Bluebell Design Studio Ltd, INV-2026-0042 due 2026-10-27 for
   exactly EUR 1,250.00. This is the Figure Lock demo draft.
 - **Reminder 21**: Greenhill Outfitters Ltd, INV-2026-0036, EUR 4,840.00.
-- **Reminder 28**: Birchfield Example Consulting GmbH, INV-2026-0031 at 28
-  days plus INV-2026-0044 at 10 days: one draft listing both.
+- **Held, not drafted**: Birchfield Example Consulting GmbH (INV-2026-0031 at
+  28 days, INV-2026-0044 at 10 days). Its EUR 700.00 receipt B1-02 waits in the
+  review queue, so Cash Desk will not remind them until a person decides.
 - **Reminder 28** (backlog): Stonebridge Holdings Ltd, INV-2026-0027 at 36
   days, EUR 12,100.00. Cash Desk never wrote to them before, so this first reminder
   states the real age and claims no earlier reminder. If it is still unpaid a week
@@ -37,9 +38,9 @@ dates as written; use `as_of=2026-11-10` there.
   which also holds INV-2026-0040.
 - **Day 1 bank**: B1-01 pays INV-2026-0045 (Fernhill Test Media Ltd) by
   reference and exact amount, so it is applied automatically and a thank-you is
-  drafted. B1-02 (EUR 700.00 from "BIRCHFIELD CONSULTING", no reference) is a
-  fuzzy candidate for INV-2026-0044 (EUR 720.00) and goes to the review queue;
-  nothing is applied.
+  drafted. B1-02 (EUR 700.00 from "BIRCHFIELD EXAMPLE CONSULTING GMBH", no reference) is
+  a candidate for INV-2026-0044 (EUR 720.00) and goes to the review queue;
+  nothing is applied and Birchfield's reminders wait.
 - **Day 2 bank**: B2-01 pays INV-2026-0043 (Lindenway Logistics Ltd) by its
   payment reference and exact amount, EUR 3,025.00: applied automatically, thank-you
   drafted. Nothing else is drafted twice on the same day.

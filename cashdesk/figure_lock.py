@@ -18,6 +18,7 @@ amount without its currency, or an IBAN that fails its checksum is.
 from __future__ import annotations
 
 import bisect
+from collections import Counter
 import difflib
 import re
 from collections.abc import Iterable, Iterator
@@ -495,9 +496,85 @@ TERM_RE = re.compile(
     r"discount|waive[sd]?|write[- ]off|settle(?:ment)? for|full and final|(?:in |as )?full settlement|half (?:of )?the|"
     r"suspend(?:ed|s)?|suspension|cut off|disconnect(?:ed)?|blacklist(?:ed)?|"
     r"pozastav\w*|polovin\w*|odpoj\w*|"
-    r"soud\w*|žalob\w*|exekuc\w*|advokát\w*|inkas\w*|úrok\w*|penále|sleva|slevu|odpust\w*)\b",
+    r"soud\w*|žalob\w*|exekuc\w*|advokát\w*|inkas\w*|úrok\w*|penále|sleva|slevu|odpust\w*|"
+    # credit reporting and other consequences
+    r"credit\s+(?:reference|rating|bureau|file|agenc(?:y|ies)|score|report(?:ing)?)\w*|experian|equifax|transunion|"
+    r"registr\w*\s+dlužník\w*|solus|crif|stop\s+(?:all\s+)?work|"
+    # new deadlines
+    r"within\s+(?:\d+|one|a|an|two|three|four|five|seven|ten|fourteen|twenty[- ]four|forty[- ]eight|seventy[- ]two)\s*"
+    r"(?:h|hrs?|hours?|days?|business\s+days?|working\s+days?)|"
+    r"(?:by|before)\s+(?:this\s+|next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|tonight|"
+    r"end\s+of\s+(?:the\s+)?(?:day|week|month)|close\s+of\s+business)|no\s+later\s+than|without\s+delay|"
+    r"(?:pay|paid|payment|settle\w*)\s+(?:\w+\s+){0,3}(?:today|tonight|tomorrow)|"
+    r"do\s+\d+\s*(?:h|hod\w*|dn[ůí]|pracovních\s+dn[ůí])|do\s+(?:zítřka|pondělí|úterý|středy|čtvrtka|pátku|soboty|neděle)|"
+    r"neprodleně|okamžitě|"
+    r"within\s+(?:a|one|two|three)\s+(?:week|month)s?|(?:by|before|until|within)\s+(?:the\s+end\s+of\s+)?(?:this|next)\s+(?:week|month)|end\s+of\s+(?:the\s+)?month|"
+    r"before\s+the\s+\d{1,2}(?:st|nd|rd|th)?|by\s+the\s+\d{1,2}(?:st|nd|rd|th)?|"
+    r"\d+\s*(?:days?|weeks?|months?|dn[ůíy]|týdn\w*|měsíc\w*)|"
+    r"\d{1,2}(?:st|nd|rd|th)?\.?\s+(?:january|february|march|april|june|july|august|september|october|november|december|"
+    r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b\.?|\d{1,2}(?:st|nd|rd|th)?\s+may(?:\s+\d{4}|[.,])|"
+    r"(?:pay|settle|payment|paid)\w*\s+(?:\w+\s+){0,3}(?:this|next)\s+(?:week|month)|"
+    r"\d{1,2}\.\s*(?:ledna|února|března|dubna|května|června|července|srpna|září|října|listopadu|prosince)|"
+    r"(?:january|february|march|april|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\.?\s+\d{1,2}(?:st|nd|rd|th)?|"
+    r"collections?\s+agenc(?:y|ies)|(?:will|shall|going\s+to|have\s+to)\s+(?:\w+\s+){0,2}(?:pause|stop|halt|suspend|cease)\w*\s+(?:\w+\s+){0,2}(?:work|services?|supply|supplies|deliver\w*|orders?)|"
+    r"cease\s+(?:supply|supplies|deliver\w*)|(?:account|orders?)\s+(?:will|may)\s+be\s+(?:put\s+)?on\s+hold|"
+    r"pay\s+half|half\s+now|(?:fifty|50)\s*(?:per\s*cent|percent|%)\s+now|(?:wait|until|till)\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\b|"
+    r"mid[-\s](?:january|february|march|april|may|june|july|august|september|october|november|december|month)|"
+    r"(?:required|must|please)\s+(?:\w+\s+){0,2}immediately|pay(?:ment)?\s+immediately(?!\s+after)|immediate\s+payment|right\s+away|"
+    r"(?:bank|banking|account|payment)\s+details\s+(?:have\s+|has\s+)?(?:changed|been\s+updated)|(?:iban|account\s+number|sort\s+code)\s+(?:has\s+|have\s+)?changed|"
+    r"updated\s+(?:bank|account|payment)\s+details|(?:our|my|the)\s+new\s+(?:bank\s+)?(?:account|iban|bank\s+details)|"
+    r"(?:bank|account|bank\s+account)\s+(?:has|have)\s+changed|moved\s+(?:our\s+)?banks?|changed\s+(?:our\s+)?banks?|switched\s+(?:our\s+)?banks?|"
+    r"(?:do\s+not|don't)\s+(?:use|pay\s+(?:in)?to)\s+(?:the\s+|this\s+|that\s+|our\s+)?(?:above\s+|old\s+)?(?:iban|account|bank)|"
+    r"(?:call|ring|phone)\s+us\s+(?:\w+\s+){0,2}before\s+(?:you\s+)?pay\w*|(?:call|ring|phone|contact)\s+(?:us\s+)?(?:\w+\s+){0,3}for\s+(?:the\s+|our\s+)?new\s+(?:bank\s+)?details|"
+    r"(?<!not\s)(?<!n't\s)pay\s+(?:the\s+amount\s+|it\s+|this\s+|again\s+)?twice|"
+    r"(?<!not\s)(?<!n't\s)(?<!need\sto\s)pay\s+(?:the\s+(?:full\s+)?(?:amount|balance|invoice)\s+|it\s+|this\s+)again|"
+    r"nový\s+bankovní\s+účet|změnili\s+jsme\s+banku|zaplaťte\s+dvakrát|před\s+platbou\s+(?:nám\s+)?zavolejte|"
+    r"nový\s+účet|nové\s+číslo\s+účtu|změn\w*\s+(?:čísl\w*\s+)?účt\w*|"
+    r"(?:one|two|three|four|five|six|several)\s+(?:weeks?|months?)\s+(?:overdue|past\s+(?:its\s+|the\s+)?due)|exekutor\w*|"
+    r"accru\w*|(?:one|two|three|four|five|six|seven|eight|nine|ten|twelve|fifteen|twenty)\s+per\s?cent|"
+    r"statutory\s+(?:compensation|interest)|late\s+payment\s+(?:act|compensation|legislation)|(?<!no\s)(?<!any\s)compensation\s+under|"
+    r"(?:other|another|second)\s+account\s+(?:with\s+us|balance)|balance\s+on\s+your\s+other|"
+    r"due\s+immediately|(?:tell|inform|warn|notify)\s+(?:other|our\s+other)\s+(?:suppliers|businesses|companies)|"
+    r"splatn\w*\s+ihned|zákonn\w*\s+(?:náhrad\w*|úrok\w*)|informovat\s+ostatní\s+dodavatel\w*|(?:druhém|jiném)\s+účtu|\w+\s+procent\w*|"
+    # fees and other money channels
+    r"(?:late|admin\w*|administration|collection|processing|reminder)\s+(?:payment\s+)?(?:fees?|charges?)|"
+    r"(?<!no\s)fees?\s+(?:will|may)\s+be\s+(?:added|charged|applied)|"
+    r"paypal|venmo|zelle|cash\s*app|western\s+union|moneygram|bitcoin|crypto\w*|gift\s+cards?|revolut|wise\.com|"
+    # a different payee
+    r"payable\s+to|in\s+the\s+name\s+of|make\s+(?:the\s+)?(?:cheque|check|transfer|payment)\s+(?:out\s+)?(?:payable\s+)?to|"
+    r"(?:pay|transfer|remit|send)\s+(?:\w+\s+){0,3}(?:in)?to\s+(?:my|his|her|their)\b|"
+    r"(?:pay|transfer|remit|send)\s+(?:\w+\s+){0,3}(?:in)?to\s+the\s+account\s+(?:of|held\s+by)|"
+    r"(?:private|personal|own)\s+(?:bank\s+)?account|held\s+by\s+our|"
+    r"(?:director|owner|partner|manager|accountant)(?:['’]s|s)?\s+(?:own\s+|personal\s+|private\s+)?(?:bank\s+)?account|"
+    r"na\s+jméno|na\s+účet\s+(?:pan[a-zí]*|paní|sl\.)|na\s+(?:můj|jeho|její)\s+(?:soukromý\s+)?účet|soukrom\w*\s+účet)\b",
     re.IGNORECASE)
 NEW_KIND_LABEL = {"link": "link", "email": "email address", "percent": "percentage", "term": "term"}
+
+
+_SALUTATION_RE = re.compile(r"^\s*(?:dear|hi|hey|hello|good\s+(?:morning|afternoon|evening))\b[\s,]*(.*)$", re.IGNORECASE)
+_BARE_NAME_RE = re.compile(r"^\s*([A-ZÁ-Ž][\w'’-]+)\s*,\s*$")
+_TITLES = {"mr", "mrs", "ms", "miss", "dr", "team", "and", "all", "everyone", "there", "pane", "paní", "pan"}
+
+
+def _greeted(text: str) -> set[str]:
+    """Names in the salutation (the first lines after the subject): capitalised words before any
+    dash or clause, without titles or 'team'."""
+    out: set[str] = set()
+    for line in (text or "").splitlines()[:4]:
+        m = _SALUTATION_RE.match(line)
+        if m:
+            for word in re.split(r"[\s,!]+", m.group(1)):
+                if not word or word in ("-", "–") or not word[0].isupper():
+                    if word.casefold() in _TITLES:
+                        continue
+                    break
+                if word.casefold() not in _TITLES:
+                    out.add(word.casefold().strip("'’"))
+            continue
+        m = _BARE_NAME_RE.match(line)
+        if m and m.group(1).casefold() not in _TITLES:
+            out.add(m.group(1).casefold())
+    return out
 
 
 def added_terms(old_text: str, new_text: str) -> list[tuple[str, str, int]]:
@@ -505,6 +582,8 @@ def added_terms(old_text: str, new_text: str) -> list[tuple[str, str, int]]:
     has and ``old_text`` did not: a rewording may change the words, not where money goes, who to
     write to, or the terms. Returns (kind, value, line) in order of appearance."""
     out: list[tuple[str, str, int]] = []
+    old_text = (old_text or "").replace("’", "'")
+    new_text = (new_text or "").replace("’", "'")
     for kind, pattern in (("link", URL_RE), ("email", EMAIL_RE), ("percent", PERCENT_RE), ("term", TERM_RE)):
         before = {m.group(0).rstrip(".,;:").casefold() for m in pattern.finditer(old_text or "")}
         seen: set[str] = set()
@@ -515,8 +594,34 @@ def added_terms(old_text: str, new_text: str) -> list[tuple[str, str, int]]:
                 continue
             seen.add(key)
             out.append((kind, value, new_text.count("\n", 0, m.start()) + 1))
+    before, after = _greeted(old_text), _greeted(new_text)
+    # Re-addressed: the new salutation names nobody the old one named (adding a surname or "team" is fine).
+    if after and not (after & before):
+        out.append(("term", "greeting " + " ".join(sorted(after)), 1))
     out.sort(key=lambda x: x[2])
     return out
+
+
+def financial_lines(text: str, lang: str) -> Counter[str]:
+    """Opaque financial rows, including their labels and repeated occurrences.
+
+    Financial prose is deliberately not parsed for meaning. Keep each such line
+    intact (apart from whitespace); only surrounding prose may be rewritten.
+    Counting lines prevents an extra demand using an otherwise allowed amount.
+    """
+    return Counter(" ".join(line.split()) for line in text.splitlines()
+                   if extract_figures(line, lang).items)
+
+
+def binding_changed(old_subject: str, old_body: str, subject: str, body: str, lang: str) -> bool:
+    if financial_lines(old_body, lang) != financial_lines(body, lang):
+        return True
+    # A subject may be shortened to prose / existing invoice identifiers. A
+    # subject containing financial facts keeps the original wording and roles.
+    found = extract_figures(subject, lang).items
+    if any(f.kind != "invoice_no" for f in found):
+        return " ".join(subject.split()) != " ".join(old_subject.split())
+    return not set(found).issubset(set(extract_figures(old_subject, lang).items))
 
 
 def revise(draft: Draft, new_text: str, allowed: Iterable[Figure], new_subject: str | None = None) -> RevisionResult:
@@ -528,10 +633,14 @@ def revise(draft: Draft, new_text: str, allowed: Iterable[Figure], new_subject: 
     """
     subject = draft.subject if new_subject is None else new_subject
     lock = check(f"{subject}\n{new_text}", draft.language, draft.figures, allowed)
+    if lock.ok and binding_changed(draft.subject, draft.body, subject, new_text, draft.language):
+        lock = replace(lock, ok=False, diff=lock.diff + (
+            "financial lines changed: keep invoice rows, totals and payment details intact; edit surrounding prose only",
+        ))
     added = added_terms(f"{draft.subject}\n{draft.body}", f"{subject}\n{new_text}")
     if added:
         notes = tuple(f"added: {NEW_KIND_LABEL[k]} {v!r} is not in the drafted text (line {line}); a rewording may not add "
-                      "links, email addresses, percentages, or legal, settlement, interest or suspension terms" for k, v, line in added)
+                      "links, email addresses, percentages, a new payee or deadline, or legal, settlement, interest, credit-reporting or suspension terms" for k, v, line in added)
         lock = replace(lock, ok=False, diff=lock.diff + notes)
     if not lock.ok:
         return RevisionResult(False, draft, lock)
@@ -556,3 +665,10 @@ __all__ = [
     "check",
     "revise",
 ]
+
+
+def figure_status(draft: Draft, allowed: Iterable[Figure]) -> list[bool]:
+    """For each figure the draft states: does the current ledger still hold it? (The Desktop's
+    per-figure badge; a figure the ledger no longer explains shows as not matching.)"""
+    allowed = list(allowed)
+    return [_explained(f, allowed) for f in draft.figures]

@@ -57,7 +57,7 @@ def test_next_weeks_export_does_not_undo_an_applied_payment(plugin, hermes_fakes
                          extra="INV-2026-0050,C001,2026-11-05,2026-11-19,300.00,EUR,300.00,open,20260050,DE89 3704 0044 0532 0130 00\n")
     inv = invoice(hermes_fakes, "INV-2026-0045")
     assert (inv["status"], inv["balance"]) == ("paid", "0.00")
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     drafts = ctx.call("cashdesk_queue", status="pending")["drafts"]
     assert not [d for d in drafts if "INV-2026-0045" in d["invoice_numbers"] and d["kind"].startswith("stage")]
 
@@ -66,7 +66,7 @@ def test_an_approved_reminder_with_an_old_amount_is_refused_and_redrafted(plugin
     """Judge: the balance changed after drafting; v1.0.0 still approved and sent the old amount."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     (draft,) = pending(ctx, "bluebell-reminder14")
     assert "EUR 1,250.00" in draft["body"]
     assert ctx.command(f"approve {draft['id']} {draft['hash'][:8]}").startswith("Approved")
@@ -74,7 +74,7 @@ def test_an_approved_reminder_with_an_old_amount_is_refused_and_redrafted(plugin
         "INV-2026-0042,C002,2026-10-13,2026-10-27,1250.00,EUR,1250.00": "INV-2026-0042,C002,2026-10-13,2026-10-27,1250.00,EUR,400.00"})
     sent = ctx.call("cashdesk_send", draft_id=draft["id"], draft_hash=draft["hash"])
     assert not sent["ok"] and "EUR 400.00 open, not the amount this draft states" in sent["error"], sent
-    again = ctx.call("cashdesk_draft", as_of=AS_OF)
+    again = ctx.draft_on(AS_OF)
     assert [s["draft_id"] for s in again["superseded"]] == [draft["id"]]
     (fresh,) = pending(ctx, "bluebell-reminder14")
     assert "EUR 400.00" in fresh["body"] and "1,250.00" not in fresh["body"]
@@ -84,11 +84,11 @@ def test_a_rejected_reminder_is_drafted_again_on_a_later_day(plugin, hermes_fake
     """Judge: a rejected reminder blocked its stage for good (`already: stage07`)."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     (draft,) = pending(ctx, "northgate-reminder")
     assert "Rejected" in ctx.command(f"reject {draft['id']} too early")
     assert not pending(ctx, "northgate-reminder")
-    ctx.call("cashdesk_draft", as_of="2026-11-11")
+    ctx.draft_on("2026-11-11")
     assert len(pending(ctx, "northgate-reminder")) == 1
 
 
@@ -151,8 +151,12 @@ def test_hermes_prompt_names_the_reminder_recipient_total_and_hash(plugin, herme
     """Judge: the second gate said only 'a reminder a person approved'."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     (draft,) = pending(ctx, "bluebell-reminder14")
+    # Not approved yet: Hermes is never asked to allow a send Cash Desk would refuse.
+    early = ctx.gate("cashdesk_send", {"draft_id": draft["id"], "draft_hash": draft["hash"]})
+    assert early["action"] == "block" and "no approval covers this exact text" in early["message"]
+    assert ctx.command(f"approve {draft['id']} {draft['hash'][:12]}").startswith("Approved")
     verdict = ctx.gate("cashdesk_send", {"draft_id": draft["id"], "draft_hash": draft["hash"]})
     assert verdict["action"] == "approve" and verdict["rule_key"] == f"cashdesk:send:{draft['hash']}"
     for part in ("Reminder 14", "Bluebell Design Studio Ltd", "mia@bluebell.example", "total EUR 1,250.00", draft["hash"][:12]):
@@ -165,7 +169,7 @@ def test_no_send_where_hermes_would_pass_its_own_prompt(plugin, hermes_fakes, mo
 
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     (draft,) = pending(ctx, "bluebell-reminder14")
     args = {"draft_id": draft["id"], "draft_hash": draft["hash"]}
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
@@ -183,7 +187,7 @@ def test_a_rewording_may_not_add_links_addresses_percentages_or_terms(plugin, he
     """Judge: Figure Lock accepted a pay-by-card link, a redirect address, 8 % interest, 'half as full settlement'."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     (draft,) = pending(ctx, "bluebell-reminder14")
     body = draft["body"]
     for addition, kind in (("Pay by card at https://pay.acme-billing.example/inv42.", "link"),
@@ -207,13 +211,13 @@ def test_only_a_reminder_that_really_went_out_is_called_earlier(plugin, hermes_f
     """Live run: the agent flagged that a first 28-day reminder claimed earlier reminders that were never sent."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     first = [d for d in ctx.call("cashdesk_queue", status="pending")["drafts"] if d["kind"].startswith("stage")]
     assert first and not [d for d in first if "earlier reminder" in d["body"].lower()]
     (north,) = pending(ctx, "northgate-reminder7")
     ctx.command(f"approve {north['id']} {north['hash'][:8]}")
     assert ctx.call("cashdesk_send", draft_id=north["id"], draft_hash=north["hash"])["ok"]
-    ctx.call("cashdesk_draft", as_of="2026-11-17")  # a week later: Northgate's invoice reaches 14 days
+    ctx.draft_on("2026-11-17")  # a week later: Northgate's invoice reaches 14 days
     (second,) = pending(ctx, "northgate-reminder14")
     assert "earlier reminder" in second["body"].lower(), second["body"]
 
@@ -222,10 +226,14 @@ def test_approving_needs_the_hash_the_person_read(plugin, hermes_fakes):
     """Second review: '/cashdesk approve <id>' approved whatever the text was at that moment."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     (draft,) = pending(ctx, "bluebell-reminder14")
     refused = ctx.command(f"approve {draft['id']}")
-    assert refused.startswith("Refused") and "add the first characters of the hash you read" in refused
+    assert refused.startswith("Refused") and "read the text first with /cashdesk show" in refused
+    assert draft['hash'][:8] not in refused  # the refusal never hands out the hash
+    shown = ctx.command(f"show {draft['id']}")
+    assert draft['body'].strip()[:40] in shown and shown.rstrip().endswith(f"/cashdesk approve {draft['id']} {draft['hash'][:12]}")
+    assert draft['hash'][:8] not in ctx.command("queue")
     assert ctx.command(f"approve {draft['id']} {draft['hash'][:8]}").startswith("Approved")
 
 
@@ -233,10 +241,10 @@ def test_a_newer_stage_replaces_the_older_unsent_reminder(plugin, hermes_fakes):
     """Second review: a pending 7-day reminder stayed sendable next to the 14-day one, still saying '7 days'."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     (seven,) = pending(ctx, "northgate-reminder7")
     ctx.command(f"approve {seven['id']} {seven['hash'][:8]}")
-    later = ctx.call("cashdesk_draft", as_of="2026-11-17")
+    later = ctx.draft_on("2026-11-17")
     assert seven["id"] in [s["draft_id"] for s in later["superseded"]]
     assert not [d for d in ctx.call("cashdesk_queue", status="approved")["drafts"] if d["id"] == seven["id"]]
     assert ctx.call("cashdesk_send", draft_id=seven["id"], draft_hash=seven["hash"])["ok"] is False
@@ -248,7 +256,8 @@ def test_a_part_payment_on_one_invoice_of_a_two_invoice_reminder_is_caught(plugi
     """Second review: 3,600 + 720 in one draft; 2,880 paid on the first left 720, which the draft 'contained'."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    assert ctx.command("dismiss B1-02 verified noninvoice receipt for amount control").startswith("Dismissed")
+    ctx.draft_on(AS_OF)
     (draft,) = pending(ctx, "birchfield-reminder28")
     ctx.command(f"approve {draft['id']} {draft['hash'][:8]}")
     import_bank(ctx, hermes_fakes, "bank-part.csv", ["X-9,2026-11-09,2880.00,EUR,BIRCHFIELD EXAMPLE CONSULTING,partial,"])
@@ -267,7 +276,7 @@ def test_an_open_invoice_export_holds_invoices_it_no_longer_lists(plugin, hermes
     path.write_text(week2, encoding="utf-8")
     result = ctx.call("cashdesk_import", kind="invoices", path=str(path), source="generic", open_list=True)
     assert result["ok"] and result["imported"]["not_in_export"] == 1, result
-    drafts = ctx.call("cashdesk_draft", as_of=AS_OF)
+    drafts = ctx.draft_on(AS_OF)
     held = [h for h in drafts["held"] if "INV-2026-0041" in h["invoice_numbers"]]
     assert held and held[0]["reason"] == "not_in_export" and "awaiting-payment.csv" in held[0]["detail"]
     assert not pending(ctx, "northgate-reminder")
@@ -286,7 +295,7 @@ def test_a_contact_list_without_ids_meets_the_invoice_export_by_name(plugin, her
     (d / "contacts.csv").write_text("Customer,Email,Full Name\nAcme Trading Ltd,ap@acme.example,Jo Example\nBeta Studio Ltd,ap@beta.example,\n", encoding="utf-8")
     c = ctx.call("cashdesk_import", kind="customers", path=str(d / "contacts.csv"))
     assert c["ok"], c
-    drafts = ctx.call("cashdesk_draft", as_of=AS_OF)
+    drafts = ctx.draft_on(AS_OF)
     to = sorted(r for dd in drafts["drafts"] for r in dd["recipients"])
     assert to == ["ap@acme.example", "ap@beta.example"], drafts["held"]
     assert len(ctx.call("cashdesk_status")["customers"] if "customers" in ctx.call("cashdesk_status") else [1, 2]) >= 1
@@ -309,7 +318,7 @@ def test_a_small_leftover_balance_is_not_chased(plugin, hermes_fakes):
     load_demo(ctx)
     import_bank(ctx, hermes_fakes, "bank-fee.csv", ["X-6,2026-11-09,1242.50,EUR,BLUEBELL DESIGN STUDIO LTD,INV-2026-0042,"])
     assert ctx.command("apply X-6 INV-2026-0042").startswith("Applied EUR 1,242.50")
-    drafts = ctx.call("cashdesk_draft", as_of=AS_OF)
+    drafts = ctx.draft_on(AS_OF)
     assert not pending(ctx, "bluebell-reminder")
     (held,) = [h for h in drafts["held"] if "INV-2026-0042" in h["invoice_numbers"]]
     assert held["reason"] == "small_balance" and "EUR 7.50" in held["detail"]
@@ -319,11 +328,14 @@ def test_rejecting_an_escalation_note_does_not_chase_the_customer_again(plugin, 
     """Second review: rejecting the internal note wiped the history and re-sent a 28-day reminder."""
     module, ctx = plugin
     load_demo(ctx)
-    ctx.call("cashdesk_draft", as_of=AS_OF)  # Stonebridge (36 days, never reminded) gets Reminder 28
-    ctx.call("cashdesk_draft", as_of="2026-11-18")  # a week later: the escalation note
+    ctx.draft_on(AS_OF)  # Stonebridge (36 days, never reminded) gets Reminder 28
+    (r28,) = [d for d in ctx.call("cashdesk_queue", status="pending")["drafts"] if d["customer_id"] == "C005" and d["kind"] == "stage28"]
+    assert ctx.command(f"approve {r28['id']} {r28['hash'][:12]}").startswith("Approved")
+    assert ctx.call("cashdesk_send", draft_id=r28["id"], draft_hash=r28["hash"])["ok"]
+    ctx.draft_on("2026-11-18")  # a week later, still unanswered: the escalation note
     (esc,) = [d for d in ctx.call("cashdesk_queue", status="pending")["drafts"] if d["kind"] == "escalation" and d["customer_id"] == "C005"]
     ctx.command(f"reject {esc['id']} handled by phone")
-    ctx.call("cashdesk_draft", as_of="2026-11-19")
+    ctx.draft_on("2026-11-19")
     assert not [d for d in ctx.call("cashdesk_queue", status="pending")["drafts"]
                 if d["customer_id"] == esc["customer_id"] and d["kind"].startswith("stage") and d["id"].endswith("nov19")]
 
@@ -335,11 +347,11 @@ def test_a_promise_to_pay_pauses_reminders_until_two_days_after_it(plugin, herme
     reply = ctx.call("cashdesk_reply", customer_id="C003", text="Sorry for the delay, we will pay by 20 November.",
                      kind="promise", promised_date="2026-11-20")
     assert reply["ok"] and reply["paused_until"] == "2026-11-20"
-    ctx.call("cashdesk_draft", as_of=AS_OF)
+    ctx.draft_on(AS_OF)
     assert not pending(ctx, "greenhill-reminder")
-    held = [h for h in ctx.call("cashdesk_draft", as_of="2026-11-12")["held"] if h["customer_id"] == "C003"]
+    held = [h for h in ctx.draft_on("2026-11-12")["held"] if h["customer_id"] == "C003"]
     assert held and held[0]["reason"] == "promise"
-    ctx.call("cashdesk_draft", as_of="2026-11-23")
+    ctx.draft_on("2026-11-23")
     assert pending(ctx, "greenhill-reminder")
 
 
@@ -362,3 +374,12 @@ def test_the_date_order_setting_is_the_default_for_imports(plugin, hermes_fakes)
     result = ctx.call("cashdesk_import", kind="bank", path=str(path))
     assert result["ok"] and result["date_order"] == "dmy", result
     assert [a["invoice_number"] for a in ctx.call("cashdesk_match", as_of=AS_OF)["applied"]] == ["INV-2026-0042"]
+
+
+def test_no_escalation_note_for_a_28_day_reminder_that_was_never_sent(plugin, hermes_fakes):
+    """Judge 13: the note said 'unanswered' about a reminder nobody had sent."""
+    module, ctx = plugin
+    load_demo(ctx)
+    ctx.draft_on(AS_OF)
+    ctx.draft_on("2026-11-18")
+    assert not [d for d in ctx.call("cashdesk_queue", status="pending")["drafts"] if d["kind"] == "escalation" and d["customer_id"] == "C005"]

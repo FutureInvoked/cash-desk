@@ -137,6 +137,7 @@ class Payment:
     counterparty: str = ""
     memo: str = ""
     source: str = "bank"
+    identity_origin: str = "provided"
 
     def __post_init__(self) -> None:
         _set(self, "id", str(self.id).strip())
@@ -146,6 +147,7 @@ class Payment:
         _set(self, "counterparty", (self.counterparty or "").strip())
         _set(self, "memo", (self.memo or "").strip())
         _set(self, "source", (self.source or "bank").strip().lower())
+        _set(self, "identity_origin", _choice(self.identity_origin, ("provided", "derived", "unknown"), "payment identity origin"))
 
     @property
     def is_outgoing(self) -> bool:

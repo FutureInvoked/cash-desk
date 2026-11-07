@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from decimal import Decimal
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .matching import invoices_named, is_refund
 from .model import Customer, Draft, Invoice, Match
@@ -44,7 +45,7 @@ ESCALATE_AFTER = 30
 ESCALATION_WAIT = 7
 RANK = {"stage07": 1, "stage14": 2, "stage21": 3, "stage28": 4, "escalation": 5}
 HOLD_REASONS = ("dispute", "on_hold", "credit_note", "payment_in_review", "no_email", "no_contact_name", "no_customer",
-                "promise", "not_in_export", "small_balance")
+                "promise", "not_in_export", "small_balance", "customer_surplus", "returned_payment", "customer_identity")
 
 # Reply classes, checked in this order: an auto-reply is never a promise, a
 # dispute wins over anything else in the same mail, "paid" beats "promise".
@@ -52,6 +53,8 @@ OUT_OF_OFFICE_WORDS = ("out of office", "automatic reply", "auto-reply", "autore
 DISPUTE_WORDS = (
     "dispute", "do not agree", "don't agree", "disagree", "incorrect", "wrong", "overbill", "overcharg", "charged twice", "not correct",
     "not ordered", "never received", "reklamac", "reklamuj", "nesouhlas", "chybn", "nesprávn", "špatn", "rozpor", "neuznáv", "neobjednal", "nedodal",
+    "not what we agreed", "what was agreed", "not agreed", "cancelled the order", "canceled the order", "cancelled our order", "canceled our order",
+    "we cancelled", "we canceled", "query this invoice", "querying", "not satisfied", "nesedí", "zrušili", "storn", "nedohodli", "jinak dohodnut",
 )
 PAID_WORDS = (
     "already paid", "have paid", "has been paid", "was paid", "we paid", "payment was made", "payment has been made", "went out", "transferred",
@@ -195,6 +198,20 @@ def _is_open_credit(inv: Invoice) -> bool:
     return inv.balance < 0 and inv.status in ("open", "disputed")
 
 
+def _customer_holds(invoices: Iterable[Invoice], customers: Mapping[str, Customer]) -> dict[str, tuple[str, str]]:
+    """Customer-wide eligibility shared by planning and the persisted approval gate."""
+    invoices = tuple(invoices)
+    held = {c.id: ("on_hold", c.hold_reason or "customer on hold") for c in customers.values() if c.on_hold}
+    for inv in invoices:
+        if inv.is_disputed and inv.balance > 0:
+            held.setdefault(inv.customer_id, ("dispute", f"{inv.number} is disputed"))
+    for inv in sorted(invoices, key=lambda i: i.number):
+        if _is_open_credit(inv):
+            held.setdefault(inv.customer_id, ("credit_note", f"open credit note {inv.number}: a reminder would state a gross total that is not owed. "
+                                                     "Set the credit note off against an invoice in the accounting system and re-import, then draft again"))
+    return held
+
+
 def _may_escalate(state: ChaseState, number: str, as_of: dt.date) -> bool:
     """Past 30 days an invoice is escalated once its stage-28 reminder exists (a week after it, when that was drafted late)."""
     if state.rank(number) < RANK["stage28"]:
@@ -204,7 +221,8 @@ def _may_escalate(state: ChaseState, number: str, as_of: dt.date) -> bool:
 
 
 def _line(inv: Invoice, days: int, amount=None) -> DraftLine:
-    return DraftLine(inv.number, inv.due_date, inv.balance if amount is None else amount, inv.currency, max(days, 0), inv.reference, inv.iban)
+    return DraftLine(inv.number, inv.due_date, inv.balance if amount is None else amount, inv.currency, max(days, 0), inv.reference, inv.iban,
+                     part_paid=Decimal("0") < inv.balance < inv.amount)
 
 
 def plan_followups(
@@ -219,7 +237,8 @@ def plan_followups(
     holds: Mapping[str, str] | None = None,
     replies: Iterable[Reply] = (),
     created_at: dt.datetime | None = None,
-    reminders_sent: Mapping[str, int] | Iterable[str] = (),
+    reminders_sent: Mapping[str, int] | Iterable[str] | None = None,
+    final_sent: Iterable[str] | None = None,
 ) -> FollowupPlan:
     """Decide today's drafts. Pure: returns a plan with an updated copy of ``state``.
 
@@ -245,22 +264,14 @@ def plan_followups(
     credit: dict[str, str] = dict(credit_notes) if isinstance(credit_notes, Mapping) else {str(n): "credit-note question" for n in credit_notes}
     review_holds = dict(holds or {})
     stamp = created_at or dt.datetime.now(dt.timezone.utc)
+    send_history_known = reminders_sent is not None
+    reminders_sent = () if reminders_sent is None else reminders_sent
     if isinstance(reminders_sent, Mapping):
         sent_counts = {str(k): int(v) for k, v in reminders_sent.items()}
     else:
         sent_counts = {str(n): 1 for n in reminders_sent}
 
-    customer_hold: dict[str, tuple[str, str]] = {}
-    for c in cust_map.values():
-        if c.on_hold:
-            customer_hold[c.id] = ("on_hold", c.hold_reason or "customer on hold")
-    for inv in inv_map.values():
-        if inv.is_disputed and inv.balance > 0:
-            customer_hold.setdefault(inv.customer_id, ("dispute", f"{inv.number} is disputed"))
-    for inv in sorted(inv_map.values(), key=lambda i: i.number):
-        if _is_open_credit(inv):
-            customer_hold.setdefault(inv.customer_id, ("credit_note", f"open credit note {inv.number}: a reminder would state a gross total that is not owed. "
-                                                       "Set the credit note off against an invoice in the accounting system and re-import, then draft again"))
+    customer_hold = _customer_holds(inv_map.values(), cust_map)
     classified: list[tuple[Reply, str]] = []
     for reply in replies:
         if reply.date > as_of:
@@ -330,7 +341,11 @@ def plan_followups(
             continue
         active = [(i, d) for i, d in items if new_state.rank(i.number) < RANK["escalation"]]
         parked = len(active) < len(items)
-        escalate = [(i, d) for i, d in active if d > ESCALATE_AFTER and _may_escalate(new_state, i.number, as_of)]
+        # "Unanswered" means a reminder actually went out: with send history known, an invoice whose
+        # 28-day reminder was only drafted is not escalated.
+        escalate = [(i, d) for i, d in active if d > ESCALATE_AFTER and _may_escalate(new_state, i.number, as_of)
+                    and (not send_history_known or sent_counts.get(i.number, 0) > 0)
+                    and (final_sent is None or i.number in final_sent)]
         escalating = {i.number for i, _ in escalate}
         chase = [(i, d) for i, d in active if i.number not in escalating]
         if chase:
@@ -347,7 +362,9 @@ def plan_followups(
                 context = RenderContext(customer, tuple(_line(i, d) for i, d in chase), sender, as_of, {}, stamp, reminders_sent=history)
                 drafts.append(render_draft(stage, customer.language, context))
                 for i, d in chase:
-                    own_stage = stage_for(d)
+                    # An invoice that rides along in another invoice's reminder before its own first stage
+                    # counts as reminded once, so a week later it does not get a gentler "7 days" mail.
+                    own_stage = stage_for(d) or ("stage07" if d > 0 else None)
                     if own_stage:
                         new_state.record(i.number, own_stage, as_of if d > ESCALATE_AFTER else None)
         if escalate:
@@ -367,6 +384,9 @@ def plan_followups(
         inv = inv_map.get(m.invoice_number)
         if inv is None or inv.is_void or inv.number in credit:
             continue
+        if review_holds.get(inv.number, "").startswith(("returned_payment:", "customer_identity:", "bank_evidence:")):
+            hold(inv.customer_id, [inv.number], review_holds[inv.number].split(":",1)[0], review_holds[inv.number])
+            continue
         if new_state.was_thanked(inv.number, m.payment_id):
             thanked_already.add(inv.customer_id)
             continue
@@ -383,7 +403,16 @@ def plan_followups(
         if problem:
             hold(cid, numbers, problem, "thank-you not drafted: the customer record has no e-mail")
             continue
-        context = RenderContext(customer, tuple(_line(i, 0, m.amount) for i, m in pairs), sender, as_of, {}, stamp)
+        # One line per invoice: two part payments to one invoice in one run are one thank-you line.
+        per_invoice: dict[str, tuple[Invoice, Decimal]] = {}
+        for i, m in pairs:
+            prior = per_invoice.get(i.number)
+            per_invoice[i.number] = (i, (prior[1] if prior else Decimal("0")) + m.amount)
+        # "Still open" only when nothing is about to settle it: no receipt in review, no credit, no other hold.
+        settled_soon = lambda i: i.number in review_holds or i.number in credit or i.customer_id in customer_hold
+        context = RenderContext(customer, tuple(replace(_line(i, 0, amount), still_open=Decimal("0") if settled_soon(i) else max(Decimal("0"), i.balance))
+                                                for i, amount in per_invoice.values()),
+                                sender, as_of, {}, stamp)
         thanks.append(render_draft("thanks", customer.language, context))
         for i, m in pairs:
             new_state.record_thanks(i.number, m.payment_id)

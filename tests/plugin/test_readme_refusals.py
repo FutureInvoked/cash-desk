@@ -1,4 +1,4 @@
-"""The README's refusal table cannot drift from the code.
+"""The refusal table (docs/refusals.md, linked from the README) cannot drift from the code.
 
 Every row names a message fragment and a test. The fragment must appear in the plugin's
 source (so the README quotes what Cash Desk really says) and inside that test's own body (so
@@ -19,8 +19,8 @@ REQUIRED = ("scheduled", "subagent", "approvals", "approved", "duplicate", "alre
 
 
 def table_rows() -> list[dict[str, str]]:
-    text = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert START in text and END in text, "README.md has no refusal table between the markers"
+    text = (ROOT / "docs" / "refusals.md").read_text(encoding="utf-8")
+    assert START in text and END in text, "docs/refusals.md has no refusal table between the markers"
     block = text.split(START, 1)[1].split(END, 1)[0]
     lines = [line.strip() for line in block.splitlines() if line.strip().startswith("|")]
     rows = [m.groupdict() for m in map(ROW.match, lines[2:])]  # skip header and separator

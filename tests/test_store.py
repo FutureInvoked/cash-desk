@@ -49,7 +49,8 @@ B2,2026-11-06,700.00,EUR,SOMEONE,project fee,
 
 
 def draft(did="d1", cid="C1", numbers=("INV-1",), body="Body EUR 1,250.00", subject="Reminder", status="pending") -> Draft:
-    d = Draft(did, "stage14", cid, tuple(numbers), "en", subject, body, ("ann@northgate.example",), NOW, status)
+    recipient = {"C1":"ann@northgate.example", "C2":"petr@modra.example", "C3":"lee@oakridge.example"}.get(cid,"ann@northgate.example")
+    d = Draft(did, "stage14", cid, tuple(numbers), "en", subject, body, (recipient,), NOW, status)
     return Draft(d.id, d.kind, d.customer_id, d.invoice_numbers, d.language, d.subject, d.body, d.recipients, d.created_at, d.status, draft_hash(body, d.recipients, subject))
 
 
@@ -173,7 +174,7 @@ def test_revision_after_approval_drops_the_approval(store):
     d = draft()
     store.create_draft(d)
     store.approve_draft("d1", d.hash, at=NOW)
-    revised = draft(body="Body, kindly: EUR 1,250.00")
+    revised = draft(body="Thank you for your help.\nBody EUR 1,250.00")
     store.replace_draft(revised)
     assert store.get_draft("d1").status == "pending" and store.get_draft("d1").hash == revised.hash
     assert store.approval("d1") is None

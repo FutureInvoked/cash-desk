@@ -5,6 +5,7 @@ Dobrý den,
 děkujeme, vaši platbu jsme obdrželi:
 
 {invoice_lines}
+{still_open}
 
 Vážíme si toho.
 

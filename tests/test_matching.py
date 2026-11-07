@@ -81,7 +81,7 @@ BANK = [
     pay("B02", "2026-10-15", "24200.00", "CZK", "Dolphin Placeholder s.r.o.", "VS 20261006"),
     pay("B03", "2026-10-16", "1000.00", "EUR", "Bluefin Demo Ltd", "FI-1003 part payment"),
     pay("B04", "2026-10-16", "9800.00", "CZK", "Ivy Test s.r.o.", "FI-1015"),
-    pay("B05", "2026-10-17", "1000.00", "EUR", "Harbor Demo Ltd", "FI-1013 FI-1014"),
+    pay("B05", "2026-10-17", "990.00", "EUR", "Harbor Demo Ltd", "FI-1013 FI-1014"),  # not their exact total: reviewed
     pay("B06", "2026-10-18", "990.00", "EUR", "Fjord Exmple OY", "payment"),
     pay("B07", "2026-10-18", "450.00", "EUR", "ACME TEST", "thanks"),
     pay("B08", "2026-10-19", "500.00", "CZK", "Elm Fiktivni a.s.", "FI-1009"),
@@ -159,7 +159,7 @@ def test_detail_texts_carry_house_style_amounts(result):
     items = {item.payment.id: item for item in result.review}
     assert "EUR 1,000.00 received, EUR 2,300.00 open; EUR 1,300.00 would remain" in items["B03"].detail
     assert "CZK 120.00 extra" in items["B04"].detail
-    assert "FI-1013, FI-1014" in items["B05"].detail and "EUR 1,000.00" in items["B05"].detail
+    assert "FI-1013, FI-1014" in items["B05"].detail and "EUR 990.00" in items["B05"].detail
     assert "CZK 500.00 received but FI-1009 is in EUR" in items["B08"].detail
     assert "2 open invoices for exactly this amount" in items["B06"].detail
     unmatched = {item.payment.id: item for item in result.unmatched}
@@ -169,7 +169,7 @@ def test_detail_texts_carry_house_style_amounts(result):
 def test_totals_keep_money_in_and_money_out_apart(result):
     totals = result.totals()
     assert totals["applied"] == {"CZK": D("24200.00"), "EUR": D("1200.00")}
-    assert totals["review_in"] == {"CZK": D("10300.00"), "EUR": D("4473.00")}
+    assert totals["review_in"] == {"CZK": D("10300.00"), "EUR": D("4463.00")}
     assert totals["out"] == {"EUR": D("1500.00")}
 
 
@@ -217,7 +217,7 @@ def test_several_invoices_summing_to_the_payment_are_suggested():
 
 
 def test_second_payment_for_an_applied_invoice_in_the_same_run_is_already_paid():
-    twice = [pay("P1", "2026-10-14", "450.00", "EUR", "Acme", "FI-1002"), pay("P2", "2026-10-15", "450.00", "EUR", "Acme", "FI-1002")]
+    twice = [pay("P1", "2026-10-14", "450.00", "EUR", "Acme Test Studio", "FI-1002"), pay("P2", "2026-10-15", "450.00", "EUR", "Acme Test Studio", "FI-1002")]
     r = match_payments(LEDGER, twice, CUSTOMERS, as_of=AS_OF)
     assert [m.payment_id for m in r.applied] == ["P1"] and r.review[0].kind == "ALREADY_PAID"
 

@@ -26,9 +26,11 @@ T = {
         window_since="Covers {a} to {b} (since the previous brief). Nothing has been sent.",
         hold="HOLD: disputes and customers on hold - no chasing",
         pay="Payments applied (not yet in a brief)", pay_since="Payments applied since the previous brief", od="Newly overdue", appr="Awaiting approval", open="Open per currency",
-        none="- none", held="HOLD", donot="DO NOT APPROVE (customer on hold)",
+        none="- none", held="HOLD", donot="DO NOT APPROVE (paused; check the hold and redraft)",
         stale="STALE: invoice now paid - do not send", stale_part="STALE IN PART: {} now paid - redraft before approving",
         totals="Total per currency", disputed="{no} disputed",
+        review="Payments to review ({n}) - Apply or Dismiss on the Cash Desk page", review_line="{d} {amt} from {who} ({id})",
+        paused="Reminders paused (no draft until the reason clears)", paused_line="{who}: {nos} ({why})",
     ),
     "cs": dict(
         title="Ranní přehled hotovosti a pohledávek",
@@ -36,9 +38,11 @@ T = {
         window_since="Období {a} až {b} (od předchozího přehledu), nic nebylo odesláno.",
         hold="POZASTAVENO: spory a pozastavení zákazníci - neupomínat",
         pay="Spárované platby (dosud v žádném přehledu)", pay_since="Platby spárované od předchozího přehledu", od="Nově po splatnosti", appr="Čeká na schválení", open="Otevřeno podle měny",
-        none="- nic", held="POZASTAVENO", donot="NESCHVALOVAT (zákazník pozastaven)",
+        none="- nic", held="POZASTAVENO", donot="NESCHVALOVAT (pozastaveno; ověřte důvod a vytvořte nový návrh)",
         stale="NEAKTUÁLNÍ: faktura už je zaplacena - neodesílat", stale_part="ČÁSTEČNĚ NEAKTUÁLNÍ: {} už zaplaceno - před schválením upravit",
         totals="Součet podle měny", disputed="{no} ve sporu",
+        review="Platby ke kontrole ({n}) - Použít nebo Zamítnout na stránce Cash Desk", review_line="{d} {amt} od {who} ({id})",
+        paused="Upomínky pozastaveny (žádný návrh, dokud důvod trvá)", paused_line="{who}: {nos} ({why})",
     ),
 }
 
@@ -83,6 +87,26 @@ def morning_brief(store_or_snapshot, as_of: dt.date, lang: str = "en") -> str:
     lines = [f"# {t['title']} - {day(as_of)}", (t["window_since"] if snapshot.previous_brief_at else t["window"]).format(a=day(a), b=day(b)), ""]
     if held:
         lines += [f"## {t['hold']}"] + [f"- {name(cid)} ({reason})" for cid, reason in sorted(held.items(), key=lambda kv: name(kv[0]))] + [""]
+
+    review = tuple(getattr(snapshot, "review", ()) or ())
+    if review:
+        lines.append(f"## {t['review'].format(n=len(review))}")
+        for p in sorted(review, key=lambda p: (p.date or as_of, p.id)):
+            lines.append("- " + t["review_line"].format(d=day(p.date) if p.date else "?", amt=money(p.amount, p.currency), who=p.counterparty or "?", id=p.id))
+        lines.append("")
+    paused: dict[str, list[str]] = {}
+    why: dict[str, str] = {}
+    for no, reason in sorted((getattr(snapshot, "paused", None) or {}).items()):
+        inv = invoices.get(no)
+        if inv is None or inv.customer_id in held or not inv.is_open:
+            continue
+        paused.setdefault(inv.customer_id, []).append(no)
+        why.setdefault(inv.customer_id, reason.split(":", 1)[0].strip().replace("_", " "))
+    if paused:
+        lines.append(f"## {t['paused']}")
+        for cid in sorted(paused, key=name):
+            lines.append("- " + t["paused_line"].format(who=name(cid), nos=", ".join(paused[cid]), why=why[cid]))
+        lines.append("")
 
     lines.append(f"## {t['pay_since'] if snapshot.previous_brief_at else t['pay']}")
     if snapshot.payments:

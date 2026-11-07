@@ -43,11 +43,34 @@ WRITE_TOOLS = frozenset({
     "cashdesk_import", "cashdesk_match", "cashdesk_draft", "cashdesk_revise",
     "cashdesk_reply", "cashdesk_hold", SEND_TOOL,
 })
-COMMAND_HELP = (
-    "/cashdesk status | queue | approve <draft-id> <hash-prefix> | reject <draft-id> [reason] | "
-    "hold <customer-id> [reason] | release <customer-id> | review | apply <payment-id> <invoice> [amount] | "
-    "dismiss <payment-id> [reason]"
-)
+HELP_TEXT = """Cash Desk commands (type /cashdesk <command>):
+
+Every day
+  status                         ledger, drafts waiting, customers on hold
+  queue                          drafts waiting for approval
+  show <draft-id>                the exact text, ending with its approve command
+  approve <draft-id> <hash>      approve the exact text you read (as shown at the end of show)
+  reject <draft-id> [reason]     drop a draft
+  review                         payments waiting for a decision
+  apply <payment-id> <invoice> [amount]   apply a payment by hand
+  dismiss <payment-id> [reason]  not an invoice payment (or already counted)
+  hold <customer-id> [reason]    pause a customer;  release <customer-id> to resume
+
+When Cash Desk pauses an invoice (it tells you which command to run)
+  still-open <invoice> <why>     an invoice missing from the latest export is still owed
+  not-duplicate <a> <b> <why>    two similar invoices are really two debts
+  send-status <draft> sent|failed <note>   a send interrupted midway (check your Sent folder first)
+  import-errors / import-error   rows an import could not trust
+  overlaps / receipt / receipt-keep / receipt-updates / receipt-update   one bank receipt seen twice
+  returns / return-unrelated / return-reverses   money the bank returned
+  settlements / reconcile        payments an export already counts
+  surpluses / surplus-accounted  overpayments
+  identities / identity-verify   customer IDs that disagree
+  bank-evidence / bank-evidence-verify   bank columns Cash Desk could not read
+
+Each of these lists what it needs and shows the exact command with its snapshot code."""
+
+COMMAND_HELP = "/cashdesk help | status | queue | show <draft-id> | approve <draft-id> <hash> | review | apply | dismiss | hold | release  (/cashdesk help lists every command)"
 
 # Set in register(); the gate asks Hermes whether the current code runs inside a
 # scheduled (cron) execution, and the tools read plugin settings through it.
@@ -86,10 +109,10 @@ IMPORT_SCHEMA = _schema(
         "kind": {"type": "string", "enum": list(IMPORT_KINDS)},
         "path": {"type": "string", "description": "Path of the CSV file. Relative paths start at the plugin folder; only the plugin data folder, demo/ and the import_dirs setting are readable. The bundled demo is four files, imported in this order: demo/customers.csv (customers), demo/invoices.csv (invoices, source generic), demo/bank_day1.csv and demo/bank_day2.csv (bank); then match and draft (as of today: the demo's dates move to today when it is loaded)."},
         "source": {"type": "string", "enum": list(INVOICE_SOURCES), "description": "Invoice export format (default generic)"},
-        "default_currency": {"type": "string", "description": "Currency for rows without one (default: the currency setting, EUR unless changed)"},
+        "default_currency": {"type": "string", "description": "Currency for rows without one. Invoices fall back to the currency setting; a bank statement with no currency column is refused until you pass the account's currency here - ask the person which currency the account is in"},
         "date_order": {"type": "string", "enum": ["auto", "dmy", "mdy"], "description": "How to read slashed dates. Default auto: decided from the whole file; a file whose dates all read both ways is refused until you say dmy (day first) or mdy (month first)."},
         "allow_errors": {"type": "boolean", "description": "Import the good rows even when some rows have errors (default false)"},
-        "open_list": {"type": "boolean", "description": "kind=invoices only: true when this export lists EVERY open invoice of its source (e.g. Xero 'Awaiting payment', QuickBooks 'Open invoices'). Invoices from the same source that it no longer lists are held as 'not in the latest export' instead of being chased. Ask the person if unsure (default false)."},
+        "open_list": {"type": "boolean", "description": "kind=invoices only. Default true: an invoice export is treated as listing every open invoice of its source, so an open invoice from the same source that it no longer lists (usually because it was paid) is held as 'not in the latest export' instead of being chased. Pass false only when the person says this file is deliberately partial (one month, one customer, new invoices only)."},
     },
     ["kind", "path"],
 )
@@ -107,7 +130,9 @@ DRAFT_SCHEMA = _schema(
     "notes for payments received, and an internal escalation note a week after an unanswered 28-day reminder. "
     "Customers on hold or in dispute get nothing. Every draft waits for a "
     "person's approval; nothing is sent.",
-    {"as_of": AS_OF, "sender": {"type": "string", "description": "Business name that signs the drafts (default: the sender_name setting)"}},
+    {"as_of": {"type": "string", "description": "Must be today's ISO date if given; drafts for any other date are refused"},
+     "sender": {"type": "string", "description": "Business name that signs the drafts (default: the sender_name setting)"},
+     "bank_checked": {"type": "boolean", "description": "Only after the person confirmed no payment is missing: draft although the last bank statement was refused"}},
 )
 QUEUE_SCHEMA = _schema(
     "cashdesk_queue",
@@ -117,10 +142,11 @@ QUEUE_SCHEMA = _schema(
 )
 REVISE_SCHEMA = _schema(
     "cashdesk_revise",
-    "Reword a draft. Figure Lock checks the new text: every amount, invoice number, due date, IBAN and "
-    "payment reference must still match the ledger exactly, with nothing added, changed or missing. A "
-    "rejected revision returns the precise diff and leaves the draft untouched; an accepted one gets a new "
-    "hash and needs a fresh approval.",
+    "Edit a draft's surrounding prose. When you write the text, keep financial lines intact, including invoice rows, totals and bank "
+    "details; whole rows may be reordered, but do not rewrite financial sentences. When the user gives their own text or asks for a "
+    "change, submit it as asked: Figure Lock, not you, decides. It checks that every amount, invoice number, due date, IBAN and "
+    "payment reference still matches the ledger exactly, with nothing added, changed or missing. A rejected revision returns the "
+    "precise diff and leaves the draft untouched (show the user that diff); an accepted one gets a new hash and needs a fresh approval.",
     {
         "draft_id": {"type": "string"},
         "new_text": {"type": "string", "description": "The complete new body"},
@@ -187,11 +213,25 @@ def _store() -> Any:
     engine = _engine()
     if engine is None:
         return None
-    from .paths import store_path
+    from .paths import store_path, today
 
     path = store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    return engine.Store(path)
+    store = engine.Store(path, today=today, ignore_balances_below=_small_balance())
+    _sync_payment_iban(engine, store, str(_config("payment_iban", "") or ""))
+    return store
+
+
+def _sync_payment_iban(engine: Any, store: Any, setting: str) -> None:
+    """Keep invoices without an export IBAN on the current payment_iban setting every time the ledger
+    is opened, so drafting, approval and sending all see the account the setting names now."""
+    own = "".join(setting.split()).upper()
+    if own and not engine.iban_valid(own):
+        return  # drafting refuses with a clear message; never write an invalid account
+    try:
+        store.sync_payment_iban(own)
+    except Exception:
+        logger.warning("cash-desk: payment_iban could not be applied", exc_info=True)
 
 
 def _close(store: Any) -> None:
@@ -252,8 +292,34 @@ def _draft_dict(store: Any, draft: Any) -> dict[str, Any]:
         "lang": draft.language, "subject": draft.subject, "body": draft.body,
         "recipients": list(draft.recipients), "invoice_numbers": list(draft.invoice_numbers),
         "created_at": draft.created_at.isoformat(), "status": draft.status, "hash": draft.hash,
-        "figures": [{"kind": f.kind, "value": f.canonical, "ok": True} for f in draft.figures],
+        "figures": _figure_badges(store, draft),
     }
+
+
+def _figure_badges(store: Any, draft: Any) -> list[dict[str, Any]]:
+    """Each stated figure with whether today's ledger still holds it (never a hard-coded tick)."""
+    try:
+        engine = _engine()
+        invoices = [store.get_invoice(n) for n in draft.invoice_numbers]
+        allowed = engine.ledger_figures(invoices)
+        states = engine.figure_status(draft, allowed)
+        # Totals and amounts received are sums the ledger implies, not single ledger figures.
+        sums: dict[str, list] = {}
+        for inv in invoices:
+            sums.setdefault(inv.currency, []).append(inv)
+        derived = set()
+        for cur, group in sums.items():
+            derived.add(f"{cur} {sum((i.balance for i in group), engine.to_money('0')):.2f}")
+            derived.add(f"{cur} {sum((i.amount for i in group), engine.to_money('0')):.2f}")
+        paid = [m for m in store.list_matches() if m.invoice_number in draft.invoice_numbers]
+        for m in paid:
+            derived.add(f"{m.currency} {m.amount:.2f}")
+        for cur in {m.currency for m in paid}:
+            derived.add(f"{cur} {sum((m.amount for m in paid if m.currency == cur), engine.to_money('0')):.2f}")
+        states = [ok or (f.kind == "money" and f.canonical in derived) for f, ok in zip(draft.figures, states)]
+    except Exception:
+        states = [None] * len(draft.figures)
+    return [{"kind": f.kind, "value": f.canonical, "ok": ok} for f, ok in zip(draft.figures, states)]
 
 
 def _payment_dict(payment: Any) -> dict[str, Any]:
@@ -263,7 +329,7 @@ def _payment_dict(payment: Any) -> dict[str, Any]:
 
 def _review_dict(item: Any) -> dict[str, Any]:
     return {
-        "payment": _payment_dict(item.payment), "kind": item.kind, "detail": item.detail, "named": list(item.named),
+        "payment": _payment_dict(item.payment), "kind": item.kind, "detail": item.detail, "named": list(item.named), "unknown_references": list(item.unknown_references),
         "candidates": [{"invoice_number": c.invoice_number, "customer_id": c.customer_id, "score": round(c.score, 2),
                         "balance": str(c.balance), "currency": c.currency} for c in item.candidates],
         "holds": list(item.holds),
@@ -272,7 +338,7 @@ def _review_dict(item: Any) -> dict[str, Any]:
 
 def _match_result(store: Any, engine: Any, as_of: date) -> Any:
     """Read-only matching pass over the unapplied payments."""
-    return engine.match_payments(store.list_invoices(), store.unapplied_payments(), store.list_customers(), as_of)
+    return store.match_result(as_of)
 
 
 # --- read-only tools -----------------------------------------------------------------------------------
@@ -284,6 +350,15 @@ def handle_status(args: dict[str, Any], **_kw: Any) -> str:
             return _json({"plugin": PLUGIN_NAME, "engine": False, "engine_version": engine_version(), "ledger": "empty"})
         try:
             snapshot = store.status_snapshot(_as_of(args.get("as_of"))).to_dict()
+            snapshot["receipt_overlap_questions"] = len(store.payment_overlaps())
+            snapshot["receipt_placement_questions"] = len(store.receipt_placement_reviews())
+            snapshot["receipt_update_questions"] = len(store.receipt_conflicts())
+            snapshot["customer_identity_questions"] = len(store.customer_identity_reviews())
+            snapshot["return_questions"] = len(store.return_reviews())
+            snapshot["surplus_questions"] = len(store.surplus_reviews())
+            snapshot["invoice_import_questions"] = len(store.invoice_import_questions())
+            snapshot["bank_evidence_questions"] = len(store.bank_evidence_questions())
+            snapshot["balances_need_review"] = bool(snapshot["bank_evidence_questions"] or snapshot["customer_identity_questions"] or snapshot["return_questions"] or snapshot["surplus_questions"] or snapshot["invoice_import_questions"] or snapshot["receipt_update_questions"] or snapshot["receipt_overlap_questions"] or snapshot["receipt_placement_questions"])
             imports = store.list_imports()
         finally:
             _close(store)
@@ -308,6 +383,20 @@ def handle_brief(args: dict[str, Any], **_kw: Any) -> str:
             try:
                 if store.list_imports():
                     text = engine.morning_brief(store, as_of, lang)
+                    if store.payment_overlaps() or store.receipt_placement_reviews():
+                        text = "Possible receipt overlap: uncertain observations and allocations are excluded from received-cash totals. Read /cashdesk overlaps before chasing or applying them.\n\n" + text
+                    if store.customer_identity_reviews():
+                        text = "Customer identity review: retained customer mappings need verification via /cashdesk identities. Balances and allocations have not been reassigned.\n\n" + text
+                    if store.return_reviews():
+                        text = "Returned payment review: retained receipts may have bounced; verify /cashdesk returns. Balances and allocations have not been reversed.\n\n" + text
+                    if store.surplus_reviews():
+                        text = "Customer surplus review: overpayment evidence may offset collection; verify /cashdesk surpluses. Observations are not extra cash and are not netted automatically.\n\n" + text
+                    if store.invoice_import_questions():
+                        text = "Invoice import uncertainty: failed updates may change the balances below; verify /cashdesk import-errors before relying on them.\n\n" + text
+                    if store.bank_evidence_questions():
+                        text = store._bank_evidence_reason().capitalize() + ". Balances and sent history are unchanged.\n\n" + text
+                    if store.receipt_conflicts():
+                        text = "Receipt update conflict: retained balances and allocations need bank verification. Read /cashdesk receipt-updates; uncertain cash is excluded from this brief.\n\n" + text
                     store.record_brief()
                     _RECENT_BRIEFS.append(text)
                     del _RECENT_BRIEFS[:-5]
@@ -340,7 +429,7 @@ def handle_queue(args: dict[str, Any], **_kw: Any) -> str:
 
 # --- tools that change the ledger ------------------------------------------------------------------------
 
-def handle_import(args: dict[str, Any], **_kw: Any) -> str:
+def _handle_import(args: dict[str, Any], **_kw: Any) -> str:
     kind = str(args.get("kind") or "").strip().lower()
     if kind not in IMPORT_KINDS:
         return _fail(f"kind must be one of {', '.join(IMPORT_KINDS)}")
@@ -364,7 +453,8 @@ def handle_import(args: dict[str, Any], **_kw: Any) -> str:
     setting = chosen_currency(str(_config("currency", "") or ""))
     currency = str(args.get("default_currency") or setting).strip().upper()
     date_order = str(args.get("date_order") or _config("date_order", "") or "auto").strip().lower()
-    open_list = bool(args.get("open_list"))
+    open_list = args.get("open_list", True)
+    open_list = open_list if isinstance(open_list, bool) else str(open_list).strip().lower() not in ("false", "0", "no", "")
     allow_errors = bool(args.get("allow_errors"))
     engine, store = _engine(), _store()
     if engine is None or store is None:
@@ -372,19 +462,56 @@ def handle_import(args: dict[str, Any], **_kw: Any) -> str:
     try:
         if kind == "customers":
             result = engine.read_customers(path)
-        elif kind == "invoices":
-            result = engine.read_invoices(source, path, default_currency=currency, date_order=date_order)
         else:
-            result = engine.read_bank_csv(path, default_currency=currency, date_order=date_order)
+            read = ((lambda order: engine.read_invoices(source, path, default_currency=currency, date_order=order)) if kind == "invoices"
+                    else (lambda order: engine.read_bank_csv(path, default_currency=currency, date_order=order)))
+            result = read(date_order)
+            if date_order in ("dmy", "mdy") and not args.get("date_order") and not is_demo_file(path):
+                doubt = _implausible_setting_order(read, result, date_order)
+                if doubt:
+                    return _fail(doubt, kind=kind)
         if is_demo_file(path):
             result = on_today(in_currency(result, setting))
+        elif kind in ("customers", "invoices"):
+            result = _default_language(engine, result, store)
+        elif kind == "bank" and not args.get("default_currency") and any(getattr(w, "code", "") == "bank_currency_default" for w in getattr(result, "warnings", ())):
+            # The setting is not evidence of which currency an account holds: a GBP account read as EUR
+            # would apply GBP 1,200 to a EUR 1,200 invoice. Ask once per file.
+            return _fail(f"this bank statement has no currency column or currency in its headers (or some lines leave it blank); Cash Desk will not assume "
+                         f"the account is in {currency}. Ask which currency this account is in and import again with "
+                         f"default_currency set (for example default_currency={currency}); nothing was imported", kind=kind)
         errors = [{"row": e.row, "message": e.message} for e in result.errors]
+        if kind == "bank" and any(e.code == "bank_status_conflict" for e in result.errors):
+            return _fail("bank status evidence conflicts: the file cannot be partially imported; verify the bank and re-export consistent lifecycle fields",
+                         kind=kind, rows=result.rows, errors=errors[:50])
+        if result.errors and any("read both ways" in e.message or "reads both ways" in e.message or "mix day-first" in e.message for e in result.errors):
+            return _fail("every date in this file reads both ways (day/month or month/day); ask how one date should be read "
+                         "(UK/EU banks: date_order=dmy, US: date_order=mdy) and import it again with date_order set; nothing was imported",
+                         kind=kind, rows=result.rows, errors=errors[:5])
+        if kind == "invoices" and open_list and "open_list" not in args:
+            listed = [r.number for r in result.records] + [c.number for c in getattr(result, "invoice_closures", ())]
+            gone, open_now = store.would_go_missing(result.source, listed)
+            if len(gone) > 2 and len(gone) * 2 > open_now:
+                return _fail(f"this file leaves out {len(gone)} of the {open_now} open invoices Cash Desk has from {result.source}. "
+                             "If it lists every open invoice (they were paid or credited), import it again with open_list=true and they "
+                             "are held as 'not in the latest export'; if it is a partial export (new invoices only, one month), import "
+                             "it with open_list=false and they keep being chased. Nothing was imported.", kind=kind,
+                             missing=gone[:20])
         if result.errors and not allow_errors:
             return _fail(f"the file has {len(result.errors)} row error(s); fix it or pass allow_errors=true",
                          kind=kind, rows=result.rows, errors=errors[:50])
         counts = store.ingest(result, allow_errors=allow_errors, file_name=path.name, open_list=open_list and kind == "invoices")
+        bank_evidence_reason = store._bank_evidence_reason() if counts.get("bank_evidence_questions") else ""
     except engine.DuplicateImportError as exc:
-        return _fail(f"already imported: {exc}", duplicate=True)
+        released = []
+        if kind == "invoices" and open_list:
+            try:
+                released = store.release_missing([inv.number for inv in result.records], file_name=path.name)
+            except Exception:
+                released = []
+        extra = (f"; it lists {len(released)} invoice(s) that were held as not in the latest export, so they are chased again: "
+                 + ", ".join(released)) if released else ""
+        return _fail(f"already imported: {exc}{extra}", duplicate=True, released=released)
     except Exception as exc:
         return _error("import failed", exc)
     finally:
@@ -392,12 +519,120 @@ def handle_import(args: dict[str, Any], **_kw: Any) -> str:
     skipped_by_reason: dict[str, int] = {}
     for row in result.skipped:
         skipped_by_reason[row.message] = skipped_by_reason.get(row.message, 0) + 1
-    return _json({"ok": True, "kind": kind, "source": result.source, "file": path.name, "rows": result.rows,
+    return _json({"ok": not bool(counts.get("bank_evidence_questions") or counts.get("customer_identity_questions") or counts.get("return_questions") or counts.get("receipt_update_questions") or counts.get("invoice_import_questions")), "quarantined": bool(counts.get("bank_evidence_questions") or counts.get("customer_identity_questions") or counts.get("return_questions") or counts.get("receipt_update_questions") or counts.get("invoice_import_questions")), "kind": kind, "source": result.source, "file": path.name, "rows": result.rows,
                   "imported": counts, "skipped": len(result.skipped), "skipped_by_reason": skipped_by_reason,
                   "credit_notes": len(getattr(result, "credit_notes", ()) or ()),
-                  "warnings": [{"row": w.row, "message": w.message} for w in (getattr(result, "warnings", ()) or ())][:50],
+                  "credit_updates": len(getattr(result, "credit_updates", ()) or ()),
+                  "warnings": ([{"row": w.row, "message": w.message} for w in (getattr(result, "warnings", ()) or ())][:50] +
+                               ([{"row": 0, "message": bank_evidence_reason}] if counts.get("bank_evidence_questions") else []) +
+                               ([{"row": 0, "message": "receipt update conflict: observations retained and quarantined; verify /cashdesk receipt-updates"}] if counts.get("receipt_update_questions") else []) +
+                               ([{"row": 0, "message": "invoice import uncertainty: failed updates retained; verify /cashdesk import-errors"}] if counts.get("invoice_import_questions") else []) +
+                               ([{"row": 0, "message": "customer identity review: verify original customer IDs via /cashdesk identities before collection"}] if counts.get("customer_identity_questions") else []) +
+                               ([{"row": 0, "message": "returned payment review: retained bank evidence needs verification via /cashdesk returns"}] if counts.get("return_questions") else []) +
+                               ([{"row": 0, "message": "customer surplus review: collection paused; verify /cashdesk surpluses"}] if counts.get("surplus_questions") else []) +
+                               ([{"row": 0, "message": f"{counts['not_in_export']} open invoice(s) from this source are not in this file and are held as "
+                                  "'not in the latest export' (probably paid). If this file is deliberately partial, say so and re-import with "
+                                  "open_list=false next time; to chase one anyway use /cashdesk still-open <invoice> <why>"}] if counts.get("not_in_export") else [])),
                   "date_order": getattr(result, "date_order", None),
                   "errors": errors, "fingerprint": result.fingerprint[:12]})
+
+
+def _bank_freshness(store: Any, as_of: date) -> str:
+    """Reminders are only as good as the newest bank statement: say so when it is old or missing."""
+    row = store._conn.execute("SELECT MAX(date) AS d FROM payments").fetchone()
+    if not row or not row["d"]:
+        return ("No bank statement has been imported, so payments are unknown: a customer who already paid may be reminded. "
+                "Import a current statement and run cashdesk_match before approving reminders.")
+    newest = date.fromisoformat(str(row["d"])[:10])
+    days = (as_of - newest).days
+    if days > 7:
+        return (f"The newest bank line is {days} days old ({newest.isoformat()}); payments since then are unknown, "
+                "so a customer who already paid may be reminded. Import a current statement (check that it was not refused) "
+                "and run cashdesk_match before approving reminders.")
+    return ""
+
+
+def handle_import(args: dict[str, Any], **kw: Any) -> str:
+    """Import, and remember a refused bank statement until one imports cleanly: reminders drafted on a
+    ledger whose newest statement was refused would chase customers who paid."""
+    raw = _handle_import(args, **kw)
+    if str(args.get("kind") or "").strip().lower() != "bank":
+        return raw
+    try:
+        out = json.loads(raw)
+    except ValueError:
+        return raw
+    store = _store()
+    if store is None:
+        return raw
+    try:
+        name = Path(str(args.get("path") or "")).name
+        error = str(out.get("error") or "")
+        if out.get("ok") or out.get("quarantined"):
+            store.clear_bank_refusals(name)  # only the refused file itself, imported cleanly, clears its hold
+        elif not out.get("duplicate") and name and not error.startswith(("no such file", "path is required")) \
+                and "outside the folders" not in error:
+            store.record_bank_refusal(name, error[:300] or "refused")
+    except Exception:
+        logger.warning("cash-desk: could not record the bank import outcome", exc_info=True)
+    finally:
+        _close(store)
+    return raw
+
+
+def _default_language(engine: Any, result: Any, store: Any) -> Any:
+    """A file with no language column says nothing about language: existing customers keep theirs,
+    new ones get the default_language setting."""
+    if any(col in ("language", "lang", "jazyk") for col in getattr(result, "columns", ())):
+        return result
+    lang = str(_config("default_language", "en") or "en").strip().lower()
+    if lang not in getattr(engine, "LANGUAGES", ("en", "cs")):
+        lang = "en"
+    known = {c.id: c.language for c in store.list_customers()}
+    from dataclasses import replace as _replace
+    pick = lambda c: _replace(c, language=known.get(c.id, lang))
+    customers = tuple(pick(c) for c in getattr(result, "customers", ()))
+    records = tuple(pick(c) for c in result.records) if result.kind == "customers" else result.records
+    return _replace(result, customers=customers, records=records)
+
+
+def _file_dates(result: Any) -> list[date]:
+    out: list[date] = []
+    for r in (*getattr(result, "records", ()), *getattr(result, "invoice_closures", ()), *getattr(result, "credit_notes", ())):
+        for name in ("issue_date", "due_date", "date"):
+            value = getattr(r, name, None)
+            if isinstance(value, date):
+                out.append(value)
+    return out
+
+
+def _implausible_setting_order(read: Any, result: Any, order: str) -> str:
+    """The date_order SETTING decided a file whose dates all read both ways. If the other reading
+    is the recent one (newest date over 45 days newer, nothing in the future), the setting is
+    probably wrong for this file: a US export read day-first states months of false lateness."""
+    try:
+        auto = read(None)
+    except Exception:
+        return ""
+    if not any("reads both ways" in getattr(e, "message", "") for e in getattr(auto, "errors", ())):
+        return ""  # the file decides its own order; the setting only agreed with it or was not needed
+    try:
+        other = read("mdy" if order == "dmy" else "dmy")
+    except Exception:
+        return ""
+    if getattr(other, "errors", ()) and not getattr(result, "errors", ()):
+        return ""
+    mine, theirs = _file_dates(result), _file_dates(other)
+    if not mine or not theirs:
+        return ""
+    from .paths import today as _today
+    now = _today()
+    if max(theirs) <= now + timedelta(days=3) and (max(theirs) - max(mine)).days > 45:
+        alt = "mdy" if order == "dmy" else "dmy"
+        return (f"every date in this file reads both ways, and your date_order setting ({order}) makes its newest date "
+                f"{max(mine).isoformat()} while {alt} makes it {max(theirs).isoformat()}. Check one date in the file and import it "
+                f"again with date_order={alt} or date_order={order}; nothing was imported")
+    return ""
 
 
 def handle_match(args: dict[str, Any], **_kw: Any) -> str:
@@ -406,6 +641,10 @@ def handle_match(args: dict[str, Any], **_kw: Any) -> str:
         return _fail("the Cash Desk engine is not available")
     try:
         as_of = _as_of(args.get("as_of"))
+        from .paths import today as _today
+        if as_of > _today():
+            return _fail(f"matching cannot run for a future date ({as_of.isoformat()}; today is {_today().isoformat()}): "
+                         "a payment dated after today is not received yet; leave as_of out")
         result = _match_result(store, engine, as_of)
         applied = [m for m in result.applied if store.apply_match(m)]
         totals = {k: {cur: str(v) for cur, v in by_cur.items()} for k, by_cur in result.totals().items()}
@@ -417,6 +656,11 @@ def handle_match(args: dict[str, Any], **_kw: Any) -> str:
             "credit_notes": [_review_dict(i) for i in result.credit_notes],
             "unmatched": [_review_dict(i) for i in result.unmatched],
             "duplicates": [p.id for p in result.duplicates],
+            "customer_identity_questions": store.customer_identity_reviews(),
+            "bank_evidence_questions": store.bank_evidence_questions(),
+            "return_questions": store.return_reviews(),
+            "receipt_placements": store.receipt_placement_reviews(),
+            "receipt_overlaps": store.payment_overlaps(),
             "skipped": [[p.id, reason] for p, reason in result.skipped],
             "totals": totals,
         })
@@ -434,53 +678,56 @@ def handle_draft(args: dict[str, Any], **_kw: Any) -> str:
     if engine is None or store is None:
         return _fail("the Cash Desk engine is not available")
     try:
-        as_of = _as_of(args.get("as_of"))
-        invoices, customers = store.list_invoices(), store.list_customers()
-        superseded = []
-        for stale, why in store.stale_drafts():
-            if stale.status != "sent":
-                store.reject_draft(stale.id, f"superseded: {why}")
-                superseded.append({"draft_id": stale.id, "reason": why})
-        review = _match_result(store, engine, as_of)
-        credit_notes = {number: item.detail for item in review.credit_notes for number in item.named}
-        holds = dict(review.held_invoices)
-        for number, file in store.missing_from_export().items():
-            holds.setdefault(number, f"not_in_export: not in the latest open-invoice export ({file}); it may have been paid. "
-                                     "Check before chasing; it is chased again if a later export lists it")
-        snoozed = store.snoozed(as_of)
-        small = _small_balance()
-        for inv in invoices:
-            if inv.customer_id in snoozed and inv.is_open:
-                until, why = snoozed[inv.customer_id]
-                holds.setdefault(inv.number, f"promise: promised to pay by {until.isoformat()}" + (f" ({why})" if why else "")
-                                 + "; no reminder until two days after that")
-            elif inv.is_open and 0 < inv.balance < small:
-                holds.setdefault(inv.number, f"small_balance: only {engine.format_money(inv.balance, inv.currency)} is open "
-                                             f"(under the ignore_balances_below setting); write it off or chase it by hand")
-        plan = engine.plan_followups(invoices, customers, store.list_matches(), store.chase_state(), as_of,
-                                     sender=sender, credit_notes=credit_notes, holds=holds,
-                                     reminders_sent=store.reminders_sent())
-        created = store.create_drafts(plan.all_drafts)
-        store.save_chase_state(plan.state)
-        reminder_kinds = ("stage07", "stage14", "stage21", "stage28")
-        new_ids = {d.id for d in plan.all_drafts}
-        for newer in plan.all_drafts:
-            if newer.kind not in reminder_kinds:
-                continue
-            for older in store.list_drafts(customer_id=newer.customer_id):
-                if (older.id not in new_ids and older.kind in reminder_kinds and older.status in ("pending", "approved", "held")
-                        and set(older.invoice_numbers) & set(newer.invoice_numbers)):
-                    store.reject_draft(older.id, f"superseded by {newer.id}", reset_stage=False)
-                    superseded.append({"draft_id": older.id, "reason": f"replaced by the newer reminder {newer.id}"})
-        return _json({
-            "ok": True, "as_of": as_of.isoformat(), "created": created,
-            "drafts": [_draft_dict(store, d) for d in plan.all_drafts],
-            "held": [{"customer_id": h.customer_id, "invoice_numbers": list(h.invoice_numbers), "reason": h.reason, "detail": h.detail} for h in plan.held],
-            "not_due": list(plan.not_due), "voided": list(plan.voided),
-            "already_drafted": [list(x) for x in plan.already_drafted],
-            "superseded": superseded,
-            "message": "Drafts wait in the approval queue (cashdesk_queue, the Desktop page or /cashdesk queue). Nothing was sent.",
-        })
+        own = "".join(str(_config("payment_iban", "") or "").split()).upper()
+        if own and not engine.iban_valid(own):
+            return _fail("the payment_iban setting is not a valid IBAN; fix it in the plugin settings before drafting")
+        if args.get("bank_checked") and store.bank_refusals():
+            store.clear_bank_refusals()  # the person checked that no payment from the refused statement is missing
+        with store.transaction():
+            store.sync_payment_iban(own)
+            as_of = _as_of(args.get("as_of"))
+            from .paths import today as _today
+            if as_of != _today():
+                return _fail(f"drafts are written for today only ({_today().isoformat()}): a reminder dated "
+                             f"{as_of.isoformat()} would state days overdue that are not true when it is sent; "
+                             "leave as_of out (use cashdesk_status or cashdesk_brief to look at another date)")
+            store.refresh_reminders(as_of)
+            invoices, customers = store.list_invoices(), store.list_customers()
+            superseded = []
+            for stale, why in store.stale_drafts():
+                if stale.status != "sent":
+                    store.reject_draft(stale.id, f"superseded: {why}")
+                    superseded.append({"draft_id": stale.id, "reason": why})
+            review = _match_result(store, engine, as_of)
+            credit_notes = {number: item.detail for item in review.credit_notes for number in item.named}
+            holds = store.reminder_holds(as_of)
+            plan = engine.plan_followups(invoices, customers, store.verified_matches(), store.chase_state(), as_of,
+                                         sender=sender, credit_notes=credit_notes, holds=holds,
+                                         reminders_sent=store.reminders_sent(), final_sent=store.final_reminders_sent())
+            created = store.create_drafts(plan.all_drafts, as_of=as_of)
+            store.save_chase_state(plan.state)
+            reminder_kinds = ("stage07", "stage14", "stage21", "stage28")
+            new_ids = {d.id for d in plan.all_drafts}
+            for newer in plan.all_drafts:
+                if newer.kind not in reminder_kinds:
+                    continue
+                for older in store.list_drafts(customer_id=newer.customer_id):
+                    if (older.id not in new_ids and older.kind in reminder_kinds and older.status in ("pending", "approved", "held")
+                            and set(older.invoice_numbers) & set(newer.invoice_numbers)):
+                        store.reject_draft(older.id, f"superseded by {newer.id}", reset_stage=False)
+                        superseded.append({"draft_id": older.id, "reason": f"replaced by the newer reminder {newer.id}"})
+            bank_warning = _bank_freshness(store, as_of) if any(d.kind.startswith("stage") for d in plan.all_drafts) else ""
+            return _json({
+                "ok": True, "as_of": as_of.isoformat(), "created": created,
+                "drafts": [_draft_dict(store, d) for d in plan.all_drafts],
+                "held": [{"customer_id": h.customer_id, "invoice_numbers": list(h.invoice_numbers), "reason": h.reason, "detail": h.detail} for h in plan.held],
+                "not_due": list(plan.not_due), "voided": list(plan.voided),
+                "already_drafted": [list(x) for x in plan.already_drafted],
+                "superseded": superseded,
+                "bank_warning": bank_warning,
+                "message": ("Drafts wait in the approval queue (cashdesk_queue, the Desktop page or /cashdesk queue). Nothing was sent."
+                            + (" Tell the person first: " + bank_warning if bank_warning else "")),
+            })
     except Exception as exc:
         return _error("drafting failed", exc)
     finally:
@@ -514,11 +761,16 @@ def handle_revise(args: dict[str, Any], **_kw: Any) -> str:
                 "missing": [engine.describe(f) for f in lock.missing],
                 "extra": [engine.describe(f) for f in lock.extra],
                 "changed": [[engine.describe(a), engine.describe(b)] for a, b in lock.changed],
-                "message": "Figure Lock rejected the revision; the draft is unchanged. Keep every figure exactly as the ledger has it.",
+                "message": ("Figure Lock rejected the revision; the draft is unchanged. " +
+                            ("Keep every figure exactly as the ledger has it." if (lock.missing or lock.extra or lock.changed)
+                             else "Reword without adding new terms (payee, deadline, fee, link, legal or credit wording) - see diff.")),
             })
         store.replace_draft(result.draft)
-        return _json({"ok": True, "draft": _draft_dict(store, result.draft),
-                      "message": "Revision accepted: same figures, new hash. The draft needs a fresh approval."})
+        stored = store.get_draft(result.draft.id)
+        message = ("Revision accepted, but the reminder stays paused. Resolve the reason and run cashdesk_draft; "
+                   "then read and approve the replacement." if stored.status == "held" else
+                   "Revision accepted: same figures, new hash. The draft needs a fresh approval.")
+        return _json({"ok": True, "draft": _draft_dict(store, stored), "message": message})
     except engine.NotFoundError as exc:
         return _fail(str(exc))
     except engine.StoreError as exc:
@@ -555,12 +807,29 @@ def handle_reply(args: dict[str, Any], **_kw: Any) -> str:
                 return _fail("promised_date must be YYYY-MM-DD")
             if snoozed_until > _as_of(None) + timedelta(days=90):
                 return _fail("a promise more than 90 days ahead is not a pause Cash Desk sets on its own; put the customer on hold instead")
-            store.snooze(customer_id, snoozed_until, text.strip()[:120])
+            current = store.snoozed(_as_of(None)).get(customer_id)
+            if current and current[0] > snoozed_until:
+                snoozed_until = current[0]  # an earlier, later-dated promise still stands
+            else:
+                store.snooze(customer_id, snoozed_until, text.strip()[:120])
+        elif label in ("promise", "paid"):
+            # Undated promise: "not this week". "We already paid": give the bank statement a few days.
+            # A pause only ever extends: a later vague reply never shortens a dated promise.
+            wanted = _as_of(None) + timedelta(days=5 if label == "promise" else 3)
+            current = store.snoozed(_as_of(None)).get(customer_id)
+            if current and current[0] >= wanted:
+                snoozed_until = current[0]
+            else:
+                snoozed_until = wanted
+                store.snooze(customer_id, snoozed_until, ("promise without a date: " if label == "promise" else "says already paid: ") + text.strip()[:100])
         advice = {
             "dispute": "Customer put on hold; their drafts are held until a person releases them with /cashdesk release.",
-            "paid": "Import the next bank statement and run cashdesk_match before drafting again.",
+            "paid": (f"No reminder goes to them before {(snoozed_until + timedelta(days=3)).isoformat() if snoozed_until else 'the next run'}. "
+                     "Import the next bank statement and run cashdesk_match; if the money is not there, the stages continue."),
             "promise": ("No reminder goes to them until two days after the promised date; then the stages continue."
-                        if snoozed_until else "Noted; pass promised_date to pause their reminders until then."),
+                        if args.get("promised_date") else
+                        f"No reminder goes to them before {(snoozed_until + timedelta(days=3)).isoformat() if snoozed_until else 'the next run'}. "
+                        "Pass promised_date (YYYY-MM-DD) to pause until two days after the promised date instead."),
             "other": "Noted; no change to the ledger.",
         }[label]
         return _json({"ok": True, "customer_id": customer_id, "classification": label, "held": held,
@@ -627,14 +896,17 @@ def handle_send(args: dict[str, Any], **_kw: Any) -> str:
         from .paths import outbox_dir
 
         draft = store.get_draft(draft_id)
-        approval = store.approval(draft_id)
-        if draft.hash != draft_hash or approval is None or approval.hash != draft_hash:
+        if draft.hash != draft_hash:
             return _fail("no approval covers this exact text; a person must approve the draft's current hash first")
         if not engine.verify_hash(draft, draft.body, draft.recipients, draft.subject):
             # The stored text was changed outside Cash Desk (e.g. straight in the SQLite file): the
             # approved hash no longer covers what would go out.
             return _fail(f"the stored text of {draft_id} does not match its approved hash; it was changed outside "
                          "Cash Desk. Nothing was sent; re-draft it and have a person approve it again")
+        store.check_draft(draft_id, draft_hash)
+        approval = store.approval(draft_id)
+        if approval is None or approval.hash != draft_hash:
+            return _fail("no approval covers this exact text; a person must approve the draft's current hash first")
         if draft.status == "sent":
             return _fail(f"draft {draft_id} was already sent; a draft goes out once")
         if draft.status != "approved":
@@ -802,13 +1074,43 @@ def gate_tool_call(tool_name: str, args: dict[str, Any], task_id: str = "", sess
                           "Cash Desk never sends without a human gate; set approvals.mode to manual or smart.")
         return _block(f"Cash Desk will not send: {weakened}. It never sends without a person answering Hermes's prompt.")
     draft_hash = str((args or {}).get("draft_hash") or "").strip()
-    if not draft_hash:
-        return _block("cashdesk_send needs the draft_hash of an approved draft.")
+    draft_id = str((args or {}).get("draft_id") or "").strip()
+    if not draft_hash or not draft_id:
+        return _block("cashdesk_send needs the draft_id and draft_hash of an approved draft.")
+    refused = _send_preflight(draft_id, draft_hash)
+    if refused:
+        # Never ask a person to allow a send that Cash Desk would refuse anyway.
+        return _block(f"Cash Desk will not send {draft_id}: {refused}")
     return {
         "action": "approve",
         "message": _send_prompt(str((args or {}).get("draft_id") or "").strip(), draft_hash),
         "rule_key": f"cashdesk:send:{draft_hash}",
     }
+
+
+def _send_preflight(draft_id: str, draft_hash: str) -> str:
+    """The same checks the send makes, before Hermes asks anyone: approval of this exact text,
+    current holds, changed figures, stale age. Returns the refusal, or "" when it may be asked."""
+    engine, store = _engine(), _store()
+    if engine is None or store is None:
+        _close(store)
+        return ""
+    try:
+        draft = store.get_draft(draft_id)
+        approval = store.approval(draft_id)
+        if draft.status == "sent":
+            return "it was already sent"
+        if approval is None or approval.hash != draft_hash or draft.hash != draft_hash:
+            why = store._conn.execute("SELECT reason FROM draft_invalidations WHERE draft_id = ?", (draft_id,)).fetchone()
+            if why and why["reason"]:
+                return f"its approval was withdrawn: {why['reason']}"
+            return "no approval covers this exact text; read the draft and approve it first"
+        store.check_draft(draft_id, draft_hash)
+        return ""
+    except Exception as exc:
+        return str(exc)
+    finally:
+        _close(store)
 
 
 def _send_prompt(draft_id: str, draft_hash: str) -> str:
@@ -842,6 +1144,8 @@ def handle_command(raw_args: str = "", **_kw: Any) -> str:
     """/cashdesk: the person's own controls. The model has no tool for approving or releasing."""
     parts = str(raw_args or "").split()
     verb = parts[0].lower() if parts else "status"
+    if verb in ("help", "?", "commands"):
+        return HELP_TEXT
     engine, store = _engine(), _store()
     if engine is None or store is None:
         return "Cash Desk: the engine is not available in this profile."
@@ -849,12 +1153,26 @@ def handle_command(raw_args: str = "", **_kw: Any) -> str:
         if verb == "status":
             snap = store.status_snapshot(_as_of(None))
             lines = [f"Cash Desk status for {snap.as_of.isoformat()}"]
+            if store.bank_evidence_questions():
+                lines.append(store._bank_evidence_reason().capitalize())
+            if store.customer_identity_reviews():
+                lines.append("Customer IDs disagree between exports: check /cashdesk identities. Reminders, thank-yous and payments for those customers wait.")
+            if store.return_reviews():
+                lines.append("Returned payment review: verify /cashdesk returns before collection or acknowledgement.")
+            if store.surplus_reviews():
+                lines.append("Customer surplus review: verify /cashdesk surpluses; customer collection is paused.")
+            if store.invoice_import_questions():
+                lines.append("Invoice import uncertainty: verify /cashdesk import-errors; affected balances and drafts are held.")
             for cur, buckets in snap.open_by_bucket.items():
                 total = sum(buckets.values())
                 overdue = sum(v for b, v in buckets.items() if b != "current")
                 lines.append(f"  {cur}: open {engine.format_money(total, cur)}, overdue {engine.format_money(overdue, cur)}")
             lines.append(f"  {snap.awaiting_approval} awaiting approval, {snap.approved_unsent} approved and unsent, "
                          f"{snap.held_drafts} held, {snap.on_hold} customer(s) on hold")
+            if store.payment_overlaps() or store.receipt_placement_reviews():
+                lines.append("Receipt identities need review; balances and received cash are not confirmed. Read /cashdesk overlaps.")
+            if store.receipt_conflicts():
+                lines.append("Receipt update conflict: retained balances/allocations need bank verification; read /cashdesk receipt-updates.")
             return "\n".join(lines)
         if verb == "queue":
             drafts = store.list_drafts(status="pending")
@@ -864,17 +1182,26 @@ def handle_command(raw_args: str = "", **_kw: Any) -> str:
             for d in drafts:
                 customer = _draft_dict(store, d)["customer"]
                 label = engine.stage_label(d.kind, "en") if engine else d.kind
-                lines.append(f"  {label} · {customer} · {d.subject}\n    id {d.id} · hash {d.hash[:12]}")
-            lines.append("Approve one with /cashdesk approve <draft-id> <hash-prefix> after reading it (cashdesk_queue shows the text).")
+                lines.append(f"  {label} · {customer} · {d.subject}\n    /cashdesk show {d.id}")
+            lines.append("Read one with /cashdesk show <draft-id>: it prints the exact text and, at the end, the approve command for it.")
             return "\n".join(lines)
+        if verb == "show":
+            if len(parts) < 2:
+                return "Usage: /cashdesk show <draft-id>"
+            d = store.get_draft(parts[1])
+            customer = _draft_dict(store, d)["customer"]
+            return (f"To: {', '.join(d.recipients) or '(internal note, not sent)'}\nSubject: {d.subject}\n\n{d.body}\n"
+                    f"---\n{customer} · status {d.status}\n"
+                    + (f"If this is the text you want sent: /cashdesk approve {d.id} {d.hash[:12]}" if d.status == "pending" and d.recipients
+                       else "Not approvable from here."))
         if verb in ("approve", "reject") and len(parts) < 2:
             return f"Usage: /cashdesk {verb} <draft-id>" + (" <hash-prefix>" if verb == "approve" else " [reason]")
         if verb == "approve":
             draft = store.get_draft(parts[1])
             prefix = parts[2] if len(parts) > 2 else ""
             if len(prefix) < 6:
-                return (f"Refused: add the first characters of the hash you read, e.g. /cashdesk approve {draft.id} {draft.hash[:8]} "
-                        "(cashdesk_queue and /cashdesk queue show it), so the approval is for the text you saw.")
+                return (f"Refused: read the text first with /cashdesk show {draft.id}; it ends with the approve command for that "
+                        "exact text, so the approval is for the text you saw.")
             if not draft.hash.startswith(prefix.lower()):
                 return f"Refused: {draft.id} now has hash {draft.hash[:12]}, not {prefix}. Re-read the draft before approving."
             store.approve_draft(draft.id, draft.hash, approved_by="slash-command")
@@ -884,10 +1211,239 @@ def handle_command(raw_args: str = "", **_kw: Any) -> str:
         if verb == "reject":
             store.reject_draft(parts[1], " ".join(parts[2:]) or "rejected by the reviewer")
             return f"Rejected {parts[1]}. Draft again later with cashdesk_draft if needed."
+        if verb == "overlaps":
+            questions = store.payment_overlaps()
+            placements = store.receipt_placement_reviews()
+            if not questions and not placements:
+                return "Cash Desk: no receipt identity questions are pending."
+            import json
+            lines = ["Possible receipt overlap: these are observed rows, not confirmed extra cash. Verify bank evidence before choosing same or distinct."]
+            for question in questions:
+                lines.append(f"  {question['id1']} / {question['id2']} · snapshot {question['snapshot']}")
+                for row in question['rows']:
+                    allocations = ', '.join(f"{m['invoice']} {m['amount']}" for m in row['allocations']) or 'none'
+                    lines.append(f"    {row['id']} · {row['date']} · observed {row['currency']} {row['amount']} · payer {row['counterparty'] or 'unknown'} · reference {row['reference'] or 'none'} · file {row['file'] or 'direct/unknown'} · allocated {allocations}" + (" · dismissed" if row['dismissed'] else ""))
+                lines.append(f"    /cashdesk receipt {json.dumps(question['id1'], ensure_ascii=False)} {json.dumps(question['id2'], ensure_ascii=False)} <same|distinct> {question['snapshot']}")
+            for item in placements:
+                lines.append(f"  {item['canonical']} · {item['message']} · snapshot {item['snapshot']}")
+                for row in item['rows']:
+                    allocations = ', '.join(f"{m['invoice']} {m['amount']}" for m in row['allocations']) or 'none'
+                    lines.append(f"    {row['id']} · {row['date']} · observed {row['currency']} {row['amount']} · payer {row['payer']} · reference {row['reference']} · allocated {allocations}")
+                lines.append(f"    /cashdesk receipt-keep {json.dumps(item['canonical'], ensure_ascii=False)} {item['snapshot']}")
+            lines.append("Same keeps the allocated original (otherwise the older row); it does not move payments. If both already have allocations, Cash Desk refuses same and keeps the conflict paused: an audited allocation correction is required.")
+            return "\n".join(lines)
+        if verb == "identities":
+            import json
+            questions=store.customer_identity_reviews()
+            if not questions:return "No customer identity questions await verification."
+            lines=["Customer identity review: compare original accounting customer IDs, invoice ownership and contacts. Equal names do not prove identity. Unknown historical remaps cannot be reconstructed. A verified owner change is permitted only for an unallocated, wholly unpaid, unsent sale; settled/credit/allocation/sent history needs an audited correction. No approval is restored."]
+            for q in questions:
+                lines.extend([f"{q['number']}: {q['detail']} · unknown legacy origin {q['legacy_unknown']}",
+                              f"  Customers: {q['customer_ids']}; affected invoices: {q['affected_invoices']}",
+                              f"  Current invoice: {q['current']}; allocations: {q['allocations']}",
+                              f"  Raw observations: {q['observations']}",
+                              f"  /cashdesk identity-verify {json.dumps(q['number'])} <verified-customer-id> {q['snapshot']} <verified-accounting-explanation>"])
+            return "\n".join(lines)
+        if verb == "identity-verify":
+            import shlex
+            values=shlex.split(str(raw_args))
+            if len(values)<5:return "Usage: /cashdesk identity-verify <invoice> <customer-id> <snapshot> <verified-accounting-explanation>; first read /cashdesk identities"
+            store.confirm_customer_identity(values[1],customer_id=values[2],expected_snapshot=values[3],reason=" ".join(values[4:]),by="slash-command")
+            return "Customer identity verification recorded. Allocation/sent history unchanged; no approval restored. Draft, read and approve fresh text."
+        if verb == "returns":
+            questions = store.return_reviews()
+            if not questions: return "No returned payment questions await verification."
+            lines = ["Returned payment review: compare the bank return, original incoming receipt and accounting records. Balances/allocations/sent history are unchanged. A genuine bounced allocation stays held for an audited correction outside this command; do not clear it as unrelated. Only confirm unrelated after verifying that every affected retained receipt remains settled."]
+            for q in questions:
+                lines.extend([f"{q['id']} · scope {q['scope']} · plausible receipts {q['receipts']}",
+                              f"  Affected customers: {q['customer_ids']}; invoices: {q['affected_invoices']}",
+                              f"  Raw evidence: {q['evidence']}; bank observations: {q['bank_observations']}",
+                              f"  Snapshot: {q['snapshot']}",
+                              f"  /cashdesk return-unrelated {q['id']} {q['snapshot']} <verified-bank-explanation>"])
+                if q.get("quarantined"):
+                    lines.extend([f"  Not yet allocated and held back from matching (may be the returned money): {q['quarantined']}",
+                                  *[f"  /cashdesk return-reverses {q['id']} {pid} {q['snapshot']} <verified-bank-explanation>" for pid in q["quarantined"]]])
+            return "\n".join(lines)
+        if verb == "return-unrelated":
+            import shlex
+            values = shlex.split(str(raw_args))
+            if len(values) < 4:
+                return "Usage: /cashdesk return-unrelated <id> <snapshot> <verified-bank-explanation>; first verify /cashdesk returns"
+            store.confirm_return_unrelated(values[1], expected_snapshot=values[2], reason=" ".join(values[3:]), by="slash-command")
+            return "Verified unrelated bank observation recorded. No balances, allocations or sent history changed. Draft/read/approve fresh text; old approval stays revoked."
+        if verb == "return-reverses":
+            import shlex
+            values = shlex.split(str(raw_args))
+            if len(values) < 5:
+                return "Usage: /cashdesk return-reverses <id> <payment-id> <snapshot> <verified-bank-explanation>; first verify /cashdesk returns"
+            store.confirm_return_reverses(values[1], values[2], expected_snapshot=values[3], reason=" ".join(values[4:]), by="slash-command")
+            return (f"Recorded: the bank returned {values[2]}. It is closed as not received; both bank rows are kept, nothing was allocated, "
+                    "and the invoice keeps its full open balance, so chasing resumes on the next draft run.")
+        if verb == "not-duplicate":
+            import shlex
+            values = shlex.split(str(raw_args))
+            if len(values) < 4:
+                return "Usage: /cashdesk not-duplicate <invoice> <other-invoice> <why they are different invoices>"
+            store.confirm_distinct_invoices(values[1], values[2], reason=" ".join(values[3:]), by="slash-command")
+            return f"Recorded: {values[1]} and {values[2]} are different invoices. Both are chased again from the next draft run."
+        if verb == "send-status":
+            if len(parts) < 4 or parts[2] not in ("sent", "failed"):
+                return ("Usage: /cashdesk send-status <draft-id> sent|failed <what you checked>  (only for a send left in progress, "
+                        "for example after the gateway stopped mid-send: check your Sent folder or outbox first)")
+            draft = store.get_draft(parts[1])
+            key = engine.idempotency_key(draft.id, draft.hash)
+            row = store._conn.execute("SELECT status FROM sends WHERE idempotency_key=?", (key,)).fetchone()
+            if row is None or row["status"] != "reserved":
+                return f"Refused: {draft.id} has no send in progress; nothing to resolve."
+            note = " ".join(parts[3:])
+            if parts[2] == "sent":
+                store.confirm_send(key)
+                store.log_event("send_resolved_by_person", draft.id, {"outcome": "sent", "note": note})
+                return f"Recorded: {draft.id} went out ({note}). It will not be sent again."
+            store.fail_send(key, f"resolved by a person: {note}"[:200])
+            return f"Recorded: {draft.id} did not go out ({note}). It can be sent again with cashdesk_send."
+        if verb == "still-open":
+            import shlex
+            values = shlex.split(str(raw_args))
+            if len(values) < 3:
+                return "Usage: /cashdesk still-open <invoice> <why you know it is still owed>; only for an invoice held as not in the latest export"
+            store.confirm_still_open(values[1], reason=" ".join(values[2:]), by="slash-command")
+            return (f"Recorded: {values[1]} is still owed although the latest export did not list it. It is chased again from the next "
+                    "draft run; nothing else changed.")
+        if verb == "surpluses":
+            questions = store.surplus_reviews()
+            if not questions: return "No customer surplus questions await verification."
+            import json
+            lines = ["Customer surplus review: verify the accounting export, all versions/currencies and any refund or set-off outside Cash Desk. Observations are NOT summed or allocated. Confirm only once the surplus is accounted for in the accounting records; no money or sent history is changed."]
+            for q in questions:
+                lines.extend([f"{q['number']}: {q['message']}", f"  Affected customers: {q['customer_ids']}; invoices: {q['affected_invoices']}", f"  Current invoice: {q['current']}",
+                              f"  Settlement basis: {q['settlements']}; local allocations: {q['allocations']}",
+                              f"  Raw observations: {q['observations']}",
+                              f"  /cashdesk surplus-accounted {json.dumps(q['number'],ensure_ascii=False)} {q['snapshot']}"])
+            return "\n".join(lines)
+        if verb == "surplus-accounted":
+            import shlex
+            values = shlex.split(str(raw_args))
+            if len(values) != 3:
+                return "Usage: /cashdesk surplus-accounted <invoice> <snapshot>; first verify the credit is accounted for via /cashdesk surpluses"
+            store.confirm_surplus(values[1], expected_snapshot=values[2], by="slash-command")
+            return "Customer surplus accounting verification recorded. No money, allocations or sent history changed. Draft/read/approve fresh text; old approval stays revoked."
+        if verb == "bank-evidence":
+            questions = store.bank_evidence_questions()
+            if not questions: return "No bank payer/reference questions await verification."
+            lines = [store._bank_evidence_reason().capitalize()+". Compare every alias/currency source with the original bank statement and current ledger. Correct and import verified source rows separately; no automatic undo or restored approval."]
+            for q in questions:
+                lines.extend([f"{q['id']} · {q['file']} row {q['row_number']} · {q['detail']}",
+                              f"  Named invoices: {q['named']}; plausible customers: {q['customer_ids']}; scope: {q['scope']}",
+                              f"  Raw evidence: {q['raw']}\n  Original cells: {q['evidence']}",
+                              f"  /cashdesk bank-evidence-verify {q['id']} {q['snapshot']} <verified-bank-explanation>"])
+            return "\n".join(lines)
+        if verb == "bank-evidence-verify":
+            import shlex
+            values = shlex.split(str(raw_args))
+            if len(values) < 4:
+                return "Usage: /cashdesk bank-evidence-verify <id> <snapshot> <verified-bank-explanation>; first verify /cashdesk bank-evidence"
+            store.confirm_bank_evidence(values[1],expected_snapshot=values[2],reason=" ".join(values[3:]),by="slash-command")
+            return "Bank evidence verification recorded. No balances, allocations or sent history changed. Import corrected cash separately, then draft/read/approve fresh text; old approvals remain revoked."
+        if verb == "import-errors":
+            questions = store.invoice_import_questions()
+            if not questions: return "No invoice import errors await verification."
+            lines = ["Invoice import uncertainty: compare each failed row with the original accounting export. Correct and re-import its source row, or explicitly confirm that the current ledger is verified. Confirmation changes no financial rows and never restores approval."]
+            for q in questions:
+                lines.append(f"{q['id']} · {q['source']} / {q['file']} row {q['row_number']} · invoice {q['number'] or 'unknown: source-wide hold'} · {q['detail']}\n  Raw evidence: {q['raw']}\n  /cashdesk import-error {q['id']} confirm {q['snapshot']}")
+            return "\n".join(lines)
+        if verb == "import-error":
+            if len(parts) != 4 or parts[2] != "confirm":
+                return "Usage: /cashdesk import-error <id> confirm <snapshot>; first verify the original export and current ledger via /cashdesk import-errors"
+            store.confirm_invoice_import_error(parts[1], expected_snapshot=parts[3], by="slash-command")
+            return "Invoice import evidence verified and audited. No financial rows changed. Draft again, read and approve fresh text; old approvals remain revoked."
+        if verb == "receipt-updates":
+            import json
+            questions = store.receipt_conflicts()
+            if not questions: return "No receipt update conflicts await verification."
+            lines = ["Receipt update conflicts: verify bank/account, transaction and settlement evidence. Allocated corrections need reconciliation; no automatic undo."]
+            for q in questions:
+                lines.extend([f"{q['original']} -> {q['observation']}: {q['reason']} ({q['status']})",
+                              f"  Before: {q['before']}",f"  Observed: {q['after']}",f"  Raw evidence: {q['evidence']}", f"  Currency evidence: {q['currency_evidence']}", f"  Allocations: {q['allocations']}; dismissals: {q['dismissals']}",
+                              f"  /cashdesk receipt-update {json.dumps(q['original'],ensure_ascii=False)} {json.dumps(q['observation'],ensure_ascii=False)} keep|distinct|replace {q['snapshot']}"])
+            return "\n".join(lines)
+        if verb == "receipt-update":
+            import shlex
+            values = shlex.split(str(raw_args))
+            if len(values) != 5:
+                return "Usage: /cashdesk receipt-update <original> <observation> keep|distinct|replace <snapshot>; verify the bank evidence first"
+            store.resolve_receipt_update(values[1],values[2],values[3],expected_snapshot=values[4],by="slash-command")
+            return "Receipt evidence decision recorded. No allocation was reversed. Run match/draft and approve fresh text; old approval remains revoked."
+        if verb == "receipt-keep":
+            import shlex
+            try:
+                values = shlex.split(str(raw_args))
+            except ValueError:
+                values = []
+            if len(values) != 3:
+                return "Usage: /cashdesk receipt-keep <canonical-id> <snapshot-from-overlaps> (confirms existing completed allocation/disposition only)"
+            store.confirm_receipt_placement(values[1], expected_snapshot=values[2], by="slash-command")
+            return "Existing receipt allocation/disposition confirmed. No money moved; draft again, read and approve fresh text."
+        if verb == "receipt":
+            import shlex
+            try:
+                values = shlex.split(str(raw_args))
+            except ValueError:
+                values = []
+            if len(values) != 5:
+                return "Usage: /cashdesk receipt <id1> <id2> same|distinct <snapshot-from-overlaps> (quote IDs containing spaces)"
+            result = store.resolve_overlap(values[1], values[2], values[3], expected_snapshot=values[4], by="slash-command")
+            detail = f"Same receipt; use {result['canonical']}" if result['decision'] == 'same' else "Distinct receipts; both original records remain"
+            return detail + ". Decisions are audited. Run cashdesk_match, then draft again, read and approve fresh text; old approvals stay invalid."
+        if verb == "settlements":
+            reviews = store.settlement_reviews()
+            if not reviews:
+                return "Cash Desk: no invoice settlements need reconciliation."
+            lines = ["Verify payments outside Cash Desk, excluding all local allocations below. Nothing changes until you reconcile:"]
+            for number, reason in reviews.items():
+                inv = store.get_invoice(number)
+                local = sum((m.amount for m in store.list_matches() if m.invoice_number == number), engine.to_money("0"))
+                token = store.settlement_snapshot(number)
+                lines.append(f"  {number} · customer {inv.customer_id} · gross {engine.format_money(inv.amount, inv.currency)} · "
+                             f"open {engine.format_money(inv.balance, inv.currency)} · local {engine.format_money(local, inv.currency)} · snapshot {token}\n    {reason}")
+                latest = next((e for e in reversed(store.events(1000)) if e.kind == "settlement_review" and e.ref == number), None)
+                if latest is not None:
+                    try:
+                        exported = engine.to_money(latest.detail["incoming_amount"]) - engine.to_money(latest.detail["incoming_balance"])
+                        likely = exported - local
+                    except Exception:
+                        likely = None
+                    if likely is not None and likely >= 0:
+                        lines.append(f"    The latest export shows {engine.format_money(exported, inv.currency)} paid. If that already includes the "
+                                     f"{engine.format_money(local, inv.currency)} applied here (the usual case), run:")
+                        lines.append(f"    /cashdesk reconcile {number} {likely} {token}")
+                        lines.append("    Otherwise enter what was paid outside Cash Desk:")
+                lines.append(f"    /cashdesk reconcile {number} <verified-external-paid> {token}")
+            return "\n".join(lines)
+        if verb == "reconcile":
+            if len(parts) != 4:
+                return "Usage: /cashdesk reconcile <invoice> <verified-external-paid-excluding-local> <snapshot-from-settlements>"
+            inv = store.get_invoice(parts[1])
+            if parts[3] != store.settlement_snapshot(inv.number):
+                return "Refused: settlement snapshot changed; read /cashdesk settlements again"
+            parsed = engine.parse_amount(parts[2], "en")
+            if parsed is None or (parsed.currency and parsed.currency != inv.currency):
+                return "Refused: enter a verified external settlement in the invoice currency"
+            store.reconcile_settlement(inv.number, parsed.value, expected_balance=inv.balance, currency=inv.currency,
+                                       expected_snapshot=parts[3], by="slash-command")
+            current = store.get_invoice(inv.number)
+            return (f"Reconciled {inv.number}: {engine.format_money(current.balance, current.currency)} open. "
+                    "Local payments are unchanged. Run cashdesk_draft, read and approve the fresh text.")
         if verb == "review":
             result = _match_result(store, engine, _as_of(None))
             items = [*result.review, *result.unmatched]
+            if store.bank_evidence_questions():
+                return store._bank_evidence_reason().capitalize()
             if not items:
+                if store.customer_identity_reviews():
+                    return "Customer identity review: verify /cashdesk identities before collection or acknowledgement."
+                if store.return_reviews():
+                    return "Returned payment review: bank observations await verification via /cashdesk returns; no return is incoming cash to Apply."
                 return "Cash Desk: no payments are waiting for a person."
             lines = [f"{len(items)} payment(s) waiting for a person (nothing here is applied):"]
             for item in items:
@@ -895,7 +1451,12 @@ def handle_command(raw_args: str = "", **_kw: Any) -> str:
                 lines.append(f"  {p.id} · {p.date.isoformat()} · {engine.format_money(p.amount, p.currency)} from {p.counterparty or 'unknown payer'} · {item.kind}: {item.detail}")
                 for c in item.candidates[:3]:
                     lines.append(f"    closest: {c.invoice_number} ({engine.format_money(c.balance, c.currency)} open)")
-            lines.append("Apply one with /cashdesk apply <payment-id> <invoice> [amount], or /cashdesk dismiss <payment-id> [reason].")
+            if store.return_reviews():
+                lines.append("Returned payment review: verify /cashdesk returns before collection or acknowledgement. Return observations cannot be applied as incoming cash.")
+            if any(item.kind == "POSSIBLE_DUPLICATE" for item in items):
+                lines.append("Resolve possible receipt overlap with /cashdesk overlaps; these rows cannot be applied or dismissed yet.")
+            if any(i.payment.amount > 0 and i.kind not in ("RETURNED_PAYMENT", "POSSIBLE_DUPLICATE", "RECEIPT_UPDATE", "INVOICE_IMPORT", "CUSTOMER_IDENTITY", "BANK_EVIDENCE") for i in items):
+                lines.append("Apply one with /cashdesk apply <payment-id> <invoice> [amount], or /cashdesk dismiss <payment-id> [reason].")
             return "\n".join(lines)
         if verb == "apply":
             if len(parts) < 3:
@@ -924,7 +1485,7 @@ def handle_command(raw_args: str = "", **_kw: Any) -> str:
         if verb == "release":
             store.clear_hold(parts[1])
             return f"{parts[1]} released; held drafts are pending again and need a fresh approval."
-        return COMMAND_HELP
+        return f"Unknown command {verb!r}.\n\n" + HELP_TEXT
     except engine.StoreError as exc:
         return f"Refused: {exc}"
     except Exception as exc:
@@ -997,8 +1558,8 @@ def _register_command(ctx: Any) -> None:
         return
     try:
         register("cashdesk", handle_command,
-                 description="Cash Desk: status, queue, approve, reject, hold, release, review, apply, dismiss (human-only actions)",
-                 args_hint="status | queue | approve <draft-id> <hash-prefix> | reject <draft-id> | hold <customer-id> | release <customer-id> | review | apply <payment-id> <invoice> [amount] | dismiss <payment-id>")
+                 description="Cash Desk: your own controls (approve, review, hold...). /cashdesk help lists every command",
+                 args_hint="help | status | queue | approve <draft-id> <hash-prefix> | reject <draft-id> | review | apply <payment-id> <invoice> | dismiss <payment-id> | hold <customer-id> | release <customer-id>")
     except Exception as exc:
         logger.warning("cash-desk: /cashdesk not registered: %s", exc)
 

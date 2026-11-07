@@ -201,7 +201,13 @@ def send_smtp(out: Outgoing, *, host: str, port: int, user: str, password: str,
                 client.quit()
             except Exception:  # pragma: no cover - best effort
                 pass
-    if refused:
+    if refused and len(refused) >= len(out.recipients):
         raise SendError(f"{len(refused)} recipient(s) refused by the server")
+    if refused:
+        # The server took the message for the other recipients: it HAS gone out. Recording this as
+        # failed would let a retry mail them twice, so it counts as sent and names who was refused.
+        return SendResult(ok=True, mode="smtp", detail=f"sent via {host}:{port} to {len(out.recipients) - len(refused)} of "
+                          f"{len(out.recipients)} recipients; refused (not retried): {', '.join(sorted(refused))}",
+                          message_id=str(msg["Message-ID"]))
     return SendResult(ok=True, mode="smtp", detail=f"sent via {host}:{port}",
                       message_id=str(msg["Message-ID"]))

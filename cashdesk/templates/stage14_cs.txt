@@ -2,7 +2,7 @@ Předmět: {reminder_lead}: {overdue_summary} ({total})
 
 Dobrý den,
 
-podle našich záznamů jsme zatím neobdrželi úhradu za:
+podle našich záznamů jsme zatím neobdrželi {cs_full}úhradu za:
 
 {invoice_lines}
 

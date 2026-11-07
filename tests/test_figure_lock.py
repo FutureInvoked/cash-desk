@@ -318,8 +318,7 @@ def _draft():
 def test_revise_accepts_a_rewording_and_rehashes():
     draft = _draft()
     allowed = ledger_figures([Invoice("INV-2026-0042", "C002", dt.date(2026, 10, 13), dt.date(2026, 10, 27), D("1250"), "EUR", D("1250"), "open", "20260042", "DE89370400440532013000")])
-    new_body = ("Hi Petr,\n\nA gentle nudge about INV-2026-0042 (EUR 1,250.00), which fell due on 2026-10-27 and is 14 days overdue.\n\n"
-                "Please pay to IBAN DE89 3704 0044 0532 0130 00 with reference 20260042.\n\nKind regards,\nExample Studio\n")
+    new_body = "Hope you are well!\n" + draft.body.replace("Kind regards,", "With thanks,")
     result = revise(draft, new_body, allowed)
     assert isinstance(result, RevisionResult) and result.ok
     assert result.draft.body == new_body and result.draft.hash != draft.hash and result.draft.id == draft.id

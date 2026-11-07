@@ -2,7 +2,7 @@ Subject: Urgent: {overdue_summary} ({total})
 
 {greeting_dear}
 
-{history}The {invoice_s} below {is_are} still unpaid. {oldest_is} now {age} past its due date:
+{history}The {invoice_s} below {is_are} still {unpaid_word}. {oldest_is} now {age} past its due date:
 
 {invoice_lines}
 

@@ -2,7 +2,7 @@ Subject: {reminder_lead}: {overdue_summary} ({total})
 
 {greeting_hi}
 
-{history}We have not yet received payment for the {invoice_s} below. {oldest_is} now {age} past its due date:
+{history}We have not yet received {payment_word} for the {invoice_s} below. {oldest_is} now {age} past its due date:
 
 {invoice_lines}
 

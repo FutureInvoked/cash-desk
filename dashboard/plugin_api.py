@@ -62,9 +62,17 @@ def _store() -> Any | None:
     store_cls = getattr(engine, "Store", None) if engine else None
     if store_cls is None:
         return None
-    path = _load_sibling("paths").store_path()
+    paths = _load_sibling("paths")
+    path = paths.store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    return store_cls(path)
+    store = store_cls(path, today=paths.today, ignore_balances_below=_setting("ignore_balances_below") or "10.00")
+    own = "".join(_setting("payment_iban").split()).upper()
+    if (not own or engine.iban_valid(own)) and hasattr(store, "sync_payment_iban"):
+        try:
+            store.sync_payment_iban(own)  # the same account the agent's tools use, before any approval here
+        except Exception:
+            pass
+    return store
 
 
 def _store_or_503() -> Any:
@@ -124,6 +132,12 @@ def _chip(snapshot: dict[str, Any]) -> str:
     held = int(snapshot.get("on_hold") or 0)
     if held and not pending:
         parts.append(f"{held} on hold")
+    placements = int(snapshot.get("receipt_placement_questions") or 0)
+    if placements:
+        return f"Review {placements} receipt allocation question(s); balances need checking"
+    questions = int(snapshot.get("receipt_overlap_questions") or 0)
+    if questions:
+        return f"Review {questions} receipt identity question(s); balances need checking"
     return " · ".join(parts) if parts else "Cash Desk"
 
 
@@ -132,6 +146,32 @@ def _label(kind: str) -> str:
     engine = _engine()
     label = getattr(engine, "stage_label", None) if engine else None
     return label(kind, "en") if label else kind
+
+
+def _figure_badges(store: Any, draft: Any) -> list[dict[str, Any]]:
+    """Each stated figure with whether today's ledger still holds it (never a hard-coded tick)."""
+    try:
+        engine = _engine()
+        invoices = [store.get_invoice(n) for n in draft.invoice_numbers]
+        allowed = engine.ledger_figures(invoices)
+        states = engine.figure_status(draft, allowed)
+        # Totals and amounts received are sums the ledger implies, not single ledger figures.
+        sums: dict[str, list] = {}
+        for inv in invoices:
+            sums.setdefault(inv.currency, []).append(inv)
+        derived = set()
+        for cur, group in sums.items():
+            derived.add(f"{cur} {sum((i.balance for i in group), engine.to_money('0')):.2f}")
+            derived.add(f"{cur} {sum((i.amount for i in group), engine.to_money('0')):.2f}")
+        paid = [m for m in store.list_matches() if m.invoice_number in draft.invoice_numbers]
+        for m in paid:
+            derived.add(f"{m.currency} {m.amount:.2f}")
+        for cur in {m.currency for m in paid}:
+            derived.add(f"{cur} {sum((m.amount for m in paid if m.currency == cur), engine.to_money('0')):.2f}")
+        states = [ok or (f.kind == "money" and f.canonical in derived) for f, ok in zip(draft.figures, states)]
+    except Exception:
+        states = [None] * len(draft.figures)
+    return [{"kind": f.kind, "value": f.canonical, "ok": ok} for f, ok in zip(draft.figures, states)]
 
 
 def _draft_dict(store: Any, draft: Any) -> dict[str, Any]:
@@ -144,7 +184,7 @@ def _draft_dict(store: Any, draft: Any) -> dict[str, Any]:
         "lang": draft.language, "subject": draft.subject, "body": draft.body,
         "recipients": list(draft.recipients), "invoice_numbers": list(draft.invoice_numbers),
         "created_at": draft.created_at.isoformat(), "status": draft.status, "hash": draft.hash,
-        "figures": [{"kind": f.kind, "value": f.canonical, "ok": True} for f in draft.figures],
+        "figures": _figure_badges(store, draft),
     }
 
 
@@ -162,6 +202,13 @@ def status() -> dict[str, Any]:
     engine = _engine()
     try:
         snapshot = store.status_snapshot(_load_sibling("paths").today()).to_dict()
+        snapshot["receipt_overlap_questions"] = len(store.payment_overlaps())
+        snapshot["receipt_placement_questions"] = len(store.receipt_placement_reviews())
+        snapshot["customer_identity_questions"] = len(store.customer_identity_reviews())
+        snapshot["surplus_questions"] = len(store.surplus_reviews())
+        snapshot["invoice_import_questions"] = len(store.invoice_import_questions())
+        snapshot["bank_evidence_questions"] = len(store.bank_evidence_questions())
+        snapshot["balances_need_review"] = bool(snapshot["bank_evidence_questions"] or snapshot["customer_identity_questions"] or snapshot["surplus_questions"] or snapshot["invoice_import_questions"] or snapshot["receipt_overlap_questions"] or snapshot["receipt_placement_questions"])
         imports = store.list_imports()
     finally:
         _close(store)
@@ -255,8 +302,24 @@ def _event_text(store: Any, engine: Any, e: dict[str, Any]) -> str:
         amount = _money(engine, d.get("amount", "0"), d.get("currency", "")) if engine else f"{d.get('currency', '')} {d.get('amount', '')}"
         who = " (applied by a person)" if d.get("method") == "person" else ""
         return f"Matched payment {d.get('payment', '?')} to {ref} · {amount}{who}"
+    if kind == "invoice_surplus_observed":
+        return f"Customer surplus needs verification for {ref}; read /cashdesk surpluses before collection"
+    if kind == "invoice_surplus_accounted":
+        return f"Customer surplus accounting verified for {ref}; no money moved, fresh approval required"
     if kind == "dismiss":
         return f"Dismissed payment {ref}: it pays none of the invoices" + (f" ({d['reason']})" if d.get("reason") else "")
+    if kind == "receipt_overlap":
+        return f"Receipt identity question: {ref} and {d.get('other', '')}; read /cashdesk overlaps before applying or chasing"
+    if kind == "receipt_placement_confirmed":
+        return f"Receipt allocation/disposition verified for {ref}; no money moved; fresh approval required"
+    if kind == "receipt_identity_resolved":
+        return f"Receipt identity verified as {d.get('decision', '')}: {ref} and {d.get('other', '')}; old approvals stay invalid"
+    if kind == "receipt_identity_conflict":
+        return f"Receipt identity still paused: {d.get('reason', '')}"
+    if kind == "settlement_review":
+        return f"Paused {ref}: {d.get('reason', '')}"
+    if kind == "settlement_reconciled":
+        return f"Reconciled {ref}: external settlement {d.get('external_paid', '')}, local payments {d.get('local_applied', '')}, open {d.get('balance', '')}; redraft and approve"
     if kind == "import_kept_payment":
         kept = _money(engine, d.get("kept_balance", "0"), d.get("currency", "")) if engine else d.get("kept_balance", "")
         return f"Kept the payment already applied to {ref}: the new export still showed more open, so its open balance stays {kept}"
@@ -268,6 +331,9 @@ def _event_text(store: Any, engine: Any, e: dict[str, Any]) -> str:
     if kind == "approve":
         by = {"desktop": " on the Desktop", "slash-command": " with /cashdesk"}.get(str(d.get("by", "")), "")
         return f"Approved {about(ref)}{by}"
+    if kind == "invalidate":
+        return (f"Paused {about(ref)}: {d.get('reason', 'the ledger changed')}. "
+                "Draft again, read the replacement and approve it before sending")
     if kind == "reject":
         return f"Rejected {about(ref)}" + (f": {d['reason']}" if d.get("reason") else "")
     if kind == "send":
@@ -311,19 +377,21 @@ def review() -> dict[str, Any]:
         unapplied = store.unapplied_payments()
         customers = {c.id: c for c in store.list_customers()}
         as_of = max([_load_sibling("paths").today(), *(p.date for p in unapplied)])
-        result = engine.match_payments(store.list_invoices(), unapplied, list(customers.values()), as_of)
+        result = store.match_result(as_of)
         items = []
         for item in (*result.review, *result.unmatched, *result.credit_notes):
             p = item.payment
             items.append({
                 "id": p.id, "date": p.date.isoformat(), "amount_display": _money(engine, p.amount, p.currency),
-                "counterparty": p.counterparty, "reference": p.reference, "kind": item.kind, "why": item.detail,
-                "incoming": p.amount > 0,
+                "counterparty": p.counterparty, "reference": p.reference, "kind": item.kind, "why": item.detail, "unknown_references": list(item.unknown_references), "named": list(item.named),
+                "incoming": p.amount > 0 and item.kind not in ("POSSIBLE_DUPLICATE", "RECEIPT_UPDATE", "INVOICE_IMPORT", "RETURNED_PAYMENT", "CUSTOMER_IDENTITY", "BANK_EVIDENCE"),
+                "held_invoices": list(item.holds),
                 "candidates": [{"invoice_number": c.invoice_number, "score": round(c.score, 2),
                                 "customer": customers[c.customer_id].name if c.customer_id in customers else c.customer_id,
                                 "balance_display": _money(engine, c.balance, c.currency)} for c in item.candidates[:3]],
             })
-        return {"payments": items, "as_of": as_of.isoformat(), "engine": True}
+        return {"payments": items, "as_of": as_of.isoformat(), "engine": True, "bank_evidence_questions": store.bank_evidence_questions(), "customer_identity_questions": store.customer_identity_reviews(), "return_questions": store.return_reviews(), "receipt_overlaps": store.payment_overlaps(), "receipt_placements": store.receipt_placement_reviews(), "receipt_updates": store.receipt_conflicts(),
+                "cash_totals": {k: {c: str(v) for c, v in totals.items()} for k, totals in result.totals().items()}}
     finally:
         _close(store)
 
@@ -334,7 +402,8 @@ def _setting(key: str) -> str:
     try:
         from hermes_cli.config import load_config_readonly
         settings = (((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}).get("cash-desk") or {}
-        return str((settings.get("settings") or {}).get(key) or "")
+        value = (settings.get("settings") or {}).get(key)
+        return "" if value is None else str(value)
     except Exception:
         return ""
 
@@ -371,7 +440,7 @@ def load_demo() -> dict[str, Any]:
             result = paths.on_today(paths.in_currency(result, currency))
             imported[key] += store.ingest(result, file_name=name).get(key, 0)
         as_of = paths.today()
-        matched = engine.match_payments(store.list_invoices(), store.unapplied_payments(), store.list_customers(), as_of)
+        matched = store.match_result(as_of)
         applied = [m for m in matched.applied if store.apply_match(m)]
         return {"ok": True, "as_of": as_of.isoformat(), "imported": imported,
                 "applied": [{"payment_id": m.payment_id, "invoice_number": m.invoice_number} for m in applied],

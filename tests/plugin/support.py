@@ -45,6 +45,13 @@ class FakeCtx:
         assert isinstance(raw, str), f"{tool} must return a JSON string"
         return json.loads(raw)
 
+    def draft_on(self, day: str, **args) -> dict:
+        """Run cashdesk_draft as if it is ``day``: moves Cash Desk's clock (CASHDESK_TODAY) first,
+        because drafts are only written for today."""
+        import os
+        os.environ["CASHDESK_TODAY"] = day
+        return self.call("cashdesk_draft", as_of=day, **args)
+
     def gate(self, tool: str, args: dict | None = None):
         (hook,) = self.hooks["pre_tool_call"]
         return hook(tool, args or {}, task_id="t-1")

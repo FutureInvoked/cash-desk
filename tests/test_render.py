@@ -223,3 +223,38 @@ def test_draft_ids_are_readable_customer_kind_invoice_day():
     assert render_draft("stage14", "cs", ctx(CS, (LINE,))).id.startswith("modra-reminder14-0042-")
     assert render_draft("thanks", "en", ctx(EN, (LINE,))).id.startswith("birchfield-thanks-0042-")
     assert render_draft("escalation", "en", ctx(EN, (LINE,))).id.startswith("birchfield-escalation-0042-")
+
+
+# ---- P2ac: wording after a part payment, dispute replies ---------------------------------
+
+import pytest as _pytest
+
+
+def _part_paid_draft(kind, lang='en'):
+    import datetime as _dt
+    from decimal import Decimal as _D
+    from cashdesk import Customer as _C
+    from cashdesk.render import DraftLine, RenderContext, render_draft
+    line = DraftLine('INV-0041', _dt.date(2026, 10, 1), _D('700'), 'EUR', 35, '', '', part_paid=True)
+    ctx = RenderContext(customer=_C('acme', 'Acme Ltd', language=lang, email='ap@acme.example', contact_name='Ann'),
+                        lines=(line,), sender='Demo Studio', as_of=_dt.date(2026, 11, 5))
+    return render_draft(kind, lang, ctx)
+
+
+@_pytest.mark.parametrize('kind,bad,good', [('stage14', 'We have not yet received payment', 'We have not yet received full payment'),
+                                           ('stage21', 'remains unpaid', 'remains not fully paid'),
+                                           ('stage28', 'is still unpaid', 'is still not fully paid')])
+def test_part_paid_reminder_never_says_payment_not_received(kind, bad, good):
+    body = _part_paid_draft(kind).body
+    assert bad not in body and good in body
+
+
+def test_part_paid_czech_reminder_says_full_payment_missing():
+    assert 'neobdrželi plnou úhradu' in _part_paid_draft('stage14', 'cs').body
+    assert 'uhrazeno jen zčásti' in _part_paid_draft('stage21', 'cs').body
+
+
+@_pytest.mark.parametrize('text', ['The amount is not what we agreed.', 'We cancelled the order in September.', 'Cena nesedí s nabídkou.', 'Objednávku jsme zrušili.'])
+def test_dispute_replies_the_keyword_fallback_used_to_miss(text):
+    from cashdesk.chasing import classify_reply
+    assert classify_reply(text) == 'dispute'

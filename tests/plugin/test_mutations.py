@@ -5,7 +5,7 @@ dates, invoice numbers, payment references, IBANs), then makes two single-digit 
 occurrence (the last digit and the first digit) and sends the edited text through the real
 ``cashdesk_revise`` tool. Every edit must be rejected with the draft left as it was. The
 untouched text, reworded, must still pass, so the lock is not simply refusing everything.
-The README quotes the totals; this test fails if they drift.
+docs/refusals.md quotes the totals; this test fails if they drift.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ MEASURED = 74
 
 
 def _readme_says(text: str) -> None:
-    assert text in (ROOT / "README.md").read_text(encoding="utf-8"), f"README.md must say {text!r}"
+    assert text in (ROOT / "docs" / "refusals.md").read_text(encoding="utf-8"), f"docs/refusals.md must say {text!r}"
 
 
 def _bump(ch: str) -> str:
@@ -40,6 +40,7 @@ def mutations(body: str, raw: str):
 def run_mutations(module, ctx):
     lock = module._engine()
     load_demo(ctx)
+    assert ctx.command("dismiss B1-02 verified noninvoice receipt for mutation control").startswith("Dismissed")
     ctx.call("cashdesk_draft", as_of=AS_OF)
     drafts = ctx.call("cashdesk_queue")["drafts"]
     tried, caught, misses, by_kind = 0, 0, [], {}
@@ -95,6 +96,7 @@ def test_the_same_run_reports_every_edit_as_a_miss_when_the_lock_is_off(plugin, 
         return engine.RevisionResult(True, revised, engine.LockResult(True))
 
     monkeypatch.setattr(engine, "revise", no_lock)
+    monkeypatch.setattr(engine.Store, "_binding_issue", lambda self, draft: None)
     drafts, tried, caught, misses, _ = run_mutations(module, ctx)
     assert caught == 0 and len(misses) == tried == MEASURED
     _readme_says(f"With the lock switched off\nthe same run reports {MEASURED} misses")

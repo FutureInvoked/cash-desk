@@ -2,7 +2,7 @@ Subject: Payment reminder: {overdue_summary} ({total})
 
 {greeting_dear}
 
-{history}The {invoice_s} below {remain_s} unpaid. {oldest_is} now {age} past its due date:
+{history}The {invoice_s} below {remain_s} {unpaid_word}. {oldest_is} now {age} past its due date:
 
 {invoice_lines}
 

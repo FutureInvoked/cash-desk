@@ -5,6 +5,7 @@ Subject: Thank you for your payment ({total})
 Thank you, we have received your payment for:
 
 {invoice_lines}
+{still_open}
 
 We appreciate it.
 

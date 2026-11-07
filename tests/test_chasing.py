@@ -338,3 +338,35 @@ def test_sender_is_required():
 def test_classify_reply(text, expected):
     assert classify_reply(text, "en") == expected
     assert classify_reply(text, "cs") == expected
+
+
+def test_invoice_riding_in_an_urgent_notice_does_not_get_a_gentler_first_reminder_later():
+    """Bookkeeper: a 1-day-overdue invoice listed in the stage-28 notice got 'Reminder: 7 days overdue' a week later."""
+    import datetime as _dt
+    from decimal import Decimal as _D
+    from cashdesk import Customer as _C, Invoice as _I
+    from cashdesk.chasing import plan_followups as _plan
+    cust = [_C('acme', 'Acme Ltd', email='ap@acme.example', contact_name='Ann')]
+    day = _dt.date(2026, 11, 5)
+    invs = [_I('OLD-1', 'acme', _dt.date(2026, 9, 1), day - _dt.timedelta(days=28), _D('500'), 'EUR', _D('500')),
+            _I('NEW-1', 'acme', _dt.date(2026, 10, 5), day - _dt.timedelta(days=1), _D('100'), 'EUR', _D('100'))]
+    first = _plan(invs, cust, [], ChaseState(), day, sender='Demo')
+    assert [d.kind for d in first.drafts] == ['stage28'] and 'NEW-1' in first.drafts[0].invoice_numbers
+    week = _plan(invs, cust, [], first.state, day + _dt.timedelta(days=7), sender='Demo')
+    assert not [d for d in week.drafts if d.kind == 'stage07']
+
+
+def test_escalation_waits_for_a_sent_28_day_reminder_even_after_earlier_sends():
+    """Review 6: a sent stage-14 plus an unsent stage-28 still produced the 'unanswered' note."""
+    import datetime as _dt
+    from decimal import Decimal as _D
+    from cashdesk import Customer as _C, Invoice as _I
+    from cashdesk.chasing import plan_followups as _plan
+    cust = [_C('acme', 'Acme Ltd', email='ap@acme.example', contact_name='Ann')]
+    day = _dt.date(2026, 11, 2)
+    inv = [_I('OLD-1', 'acme', _dt.date(2026, 9, 1), day - _dt.timedelta(days=28), _D('500'), 'EUR', _D('500'))]
+    first = _plan(inv, cust, [], ChaseState(), day, sender='Demo', reminders_sent={'OLD-1': 1}, final_sent=set())
+    later = _plan(inv, cust, [], first.state, day + _dt.timedelta(days=7), sender='Demo', reminders_sent={'OLD-1': 1}, final_sent=set())
+    assert not later.escalations
+    sent = _plan(inv, cust, [], first.state, day + _dt.timedelta(days=7), sender='Demo', reminders_sent={'OLD-1': 2}, final_sent={'OLD-1'})
+    assert sent.escalations

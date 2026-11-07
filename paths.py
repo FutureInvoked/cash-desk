@@ -65,6 +65,24 @@ def today():
         return _dt.date.today()
 
 
+def _with_demo_records(result, records):
+    from dataclasses import replace
+    by_id = {record.id: record for record in records if hasattr(record, "id")}
+    observations = []
+    for observation in getattr(result, "bank_observations", ()):
+        payment = by_id.get(observation.payment.id, observation.payment) if observation.payment else None
+        evidence = observation.evidence
+        if payment and payment.currency != observation.payment.currency and evidence and evidence.get("currency_basis"):
+            basis = evidence["currency_basis"]
+            evidence = {**evidence,"currency_basis":{**basis,"resolved":payment.currency,"basis":"demo_label",
+                                                      "original_currency":basis["resolved"]}}
+        observations.append(replace(observation,payment=payment,evidence=evidence))
+    invoices = {record.number: record for record in records if hasattr(record, "number")}
+    surpluses = tuple(replace(o, issue_date=invoices[o.number].issue_date, currency=invoices[o.number].currency)
+                      if o.number in invoices else o for o in getattr(result, "invoice_surpluses", ()))
+    return replace(result, records=records, bank_observations=tuple(observations), invoice_surpluses=surpluses)
+
+
 def on_today(result, day=None):
     """The bundled demo always happens today: move every invoice and payment date by the gap
     between today and the demo's own day, so "7 days overdue" is true whenever it is loaded.
@@ -80,7 +98,7 @@ def on_today(result, day=None):
         changes = {f.name: getattr(record, f.name) + shift for f in fields(record)
                    if isinstance(getattr(record, f.name), _dt.date) and not isinstance(getattr(record, f.name), _dt.datetime)}
         moved.append(replace(record, **changes) if changes else record)
-    return replace(result, records=tuple(moved))
+    return _with_demo_records(result, tuple(moved))
 
 
 DEFAULT_CURRENCY = "EUR"
@@ -107,7 +125,7 @@ def in_currency(result, currency: str):
     if currency == DEFAULT_CURRENCY or not getattr(result, "records", None):
         return result
     records = tuple(replace(r, currency=currency) if getattr(r, "currency", None) == DEFAULT_CURRENCY else r for r in result.records)
-    return replace(result, records=records)
+    return _with_demo_records(result, records)
 
 
 def outbox_dir(configured: str = "") -> Path:

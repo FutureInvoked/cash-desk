@@ -182,3 +182,15 @@ def test_a_named_certificate_is_honoured_even_when_hermes_injected_truststore(mo
     ca.write_text("x", encoding="utf-8")
     ctx = sending.smtp_tls_context(str(ca))
     assert type(ctx) is original and ctx.verify_mode == sending.ssl.CERT_REQUIRED and ctx.check_hostname
+
+
+def test_partly_refused_recipients_count_as_sent_so_a_retry_cannot_mail_twice(fake_smtp, monkeypatch):
+    def partly(host, port, timeout=None, context=None):
+        c = FakeSMTP(host, port, timeout, context)
+        c.refuse = {"finance@example-customer.test": (550, b"no such user")}
+        return c
+    monkeypatch.setattr(sending.smtplib, "SMTP", partly)
+    from dataclasses import replace
+    out = replace(outgoing(), recipients=("billing@example-customer.test", "finance@example-customer.test"))
+    result = sending.send_smtp(out, host="smtp.example.test", port=587, user="u", password="s3cret")
+    assert result.ok and "1 of 2 recipients" in result.detail and "finance@example-customer.test" in result.detail

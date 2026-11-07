@@ -140,7 +140,10 @@ def parse_amount(text: str, lang: str | None = None, *, strict: bool = False) ->
     value = _digits(m.group("num"), lang, strict)
     if value is None:
         return None
-    currency = normalise_currency(m.group("cur1")) or normalise_currency(m.group("cur2"))
+    first_currency, last_currency = (normalise_currency(m.group(key)) for key in ("cur1", "cur2"))
+    if first_currency and last_currency and first_currency != last_currency:
+        return None
+    currency = first_currency or last_currency
     if (m.group("cur1") and currency is None) or (m.group("cur2") and currency is None):
         return None
     if bool(m.group("open")) != bool(m.group("close")):

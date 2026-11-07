@@ -122,8 +122,34 @@ function Queue({ drafts, approve, hold, reject }) {
   ] })
 }
 
-function Review({ payments, apply, dismiss }) {
-  if (!payments.length) return jsx('div', { style: styles.muted, children: 'No payment is waiting for a person.' })
+function IdentityQuestions({ questions }) {
+  return jsx('div', { children: questions.map(q => jsxs('div', { style: { ...styles.td, marginBottom: 8 }, children: [
+    jsx('strong', { children: 'Customer identity review' }),
+    jsx('div', { children: `${q.number}: ${q.detail}. Affected invoices: ${q.affected_invoices.join(', ') || 'none known yet'}.` }),
+    jsx('div', { style: styles.muted, children: 'Equal names do not prove customer identity. Collection and acknowledgements wait for verification of original source IDs with /cashdesk identities. Allocations and sent history are unchanged.' }),
+  ] }, q.number)) })
+}
+
+function ReturnQuestions({ questions }) {
+  return jsx('div', { children: questions.map(q => jsxs('div', { style: { ...styles.td, marginBottom: 8 }, children: [
+    jsx('strong', { children: 'Returned payment review' }),
+    jsx('div', { children: `Plausible receipts: ${q.receipts.join(', ') || 'unknown'}; affected invoices: ${q.affected_invoices.join(', ') || 'none known yet'}.` }),
+    jsx('div', { style: styles.muted, children: 'Collection and acknowledgements are paused. Balances and allocations are unchanged. Verify bank and accounting evidence with /cashdesk returns; a genuine bounced allocation needs an audited correction.' }),
+  ] }, q.id)) })
+}
+
+function BankEvidenceQuestions({ questions }) {
+  return jsx('div', { children: questions.map(q => jsxs('div', { style: { ...styles.td, marginBottom: 8 }, children: [
+    jsx('strong', { children: q.evidence?.kind === 'payer' ? 'Payer legal identity needs review' : q.evidence?.kind === 'reference' ? 'Reference evidence needs review' : q.evidence?.kind === 'currency' ? 'Bank currency evidence conflicts' : 'Bank payer/reference evidence conflicts' }),
+    jsx('div', { children: `${q.file} row ${q.row_number}: ${q.detail}. Named invoices: ${q.named.join(', ') || 'unknown'}.` }),
+    q.evidence?.kind === 'payer' ? jsx('div', { children: `Bank payer: ${(q.evidence.payers ?? []).join(', ')}; allocated customer: ${(q.evidence.customer_names ?? []).join(', ')}. Verify legal identity against the original bank and customer records.` }) : null,
+    q.evidence?.kind === 'reference' ? jsx('div', { children: `Unknown invoice/reference identifiers: ${(q.evidence.unknown_references ?? []).join(', ') || 'none; verify identifier role and original allocation'}.` }) : null,
+    jsx('div', { style: styles.muted, children: 'All allocation, collection and acknowledgements are paused across the whole ledger. Verify the original bank evidence and current ledger with /cashdesk bank-evidence. Balances, allocations and sent history are unchanged.' }),
+  ] }, q.id)) })
+}
+
+function Review({ payments, returns, identities, bankEvidence, apply, dismiss }) {
+  if (!payments.length) return jsx('div', { style: styles.muted, children: bankEvidence.length ? 'Bank evidence questions above await verification.' : identities.length ? 'Customer identity questions above await verification.' : returns.length ? 'Returned payment questions above await verification.' : 'No payment is waiting for a person.' })
   return jsxs('table', { style: styles.table, children: [
     jsx('thead', { children: jsx('tr', { children: ['Payment', 'From', 'Why it was not applied', 'Closest invoices'].map((h, i) => jsx('th', { style: styles.th, children: h }, i)) }) }),
     jsx('tbody', { children: payments.map(p => jsxs('tr', { children: [
@@ -168,7 +194,7 @@ function Page() {
   const release = useAction('Customer released; held drafts are pending again.')
   const applyPayment = useAction('Payment applied. Reminders that stated the old amount are redrafted on the next draft run.')
   const dismissPayment = useAction('Payment dismissed: it pays none of these invoices.')
-  const demo = useAction('Demo data loaded (made-up companies, dated so that today is the demo day). Ask the agent to draft today's reminders; drafts appear here.')
+  const demo = useAction("Demo data loaded (made-up companies, dated so that today is the demo day). Ask the agent to draft today's reminders; drafts appear here.")
   if (status.isLoading) return jsx('div', { style: styles.page, children: jsx(GlyphSpinner, {}) })
   if (status.isError) return jsx('div', { style: styles.page, children: jsx(ErrorState, { title: 'Cash Desk backend unreachable', description: 'Enable cash-desk under plugins.enabled for this profile and restart the gateway.' }) })
   const snap = status.data ?? {}
@@ -187,7 +213,7 @@ function Page() {
     jsxs('div', { style: styles.row, children: [jsx('h1', { style: styles.h1, children: 'Cash Desk' }), jsx('span', { style: styles.muted, children: snap.chip }), snap.as_of ? jsx('span', { style: styles.muted, children: `as of ${snap.as_of}` }) : null] }),
     jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Open balance by age' }), jsx(Buckets, { snap })] }),
     jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Approval queue' }), jsx(Queue, { drafts: drafts.data?.drafts ?? [], approve, hold, reject })] }),
-    jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Payments to review' }), jsx('div', { style: { ...styles.muted, marginBottom: 6 }, children: 'Only an exact reference and amount from the right payer is applied automatically. These wait for you: Apply puts a payment on an invoice (never more than is open), Dismiss says it pays none of them.' }), jsx(Review, { payments: review.data?.payments ?? [], apply: applyPayment, dismiss: dismissPayment })] }),
+    jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Payments to review' }), jsx('div', { style: { ...styles.muted, marginBottom: 6 }, children: 'Only an exact reference and amount from the right payer is applied automatically. These wait for you: Apply puts a payment on an invoice (never more than is open), Dismiss says it pays none of them.' }), jsx(BankEvidenceQuestions, { questions: review.data?.bank_evidence_questions ?? [] }), jsx(IdentityQuestions, { questions: review.data?.customer_identity_questions ?? [] }), jsx(ReturnQuestions, { questions: review.data?.return_questions ?? [] }), jsx(Review, { bankEvidence: review.data?.bank_evidence_questions ?? [], identities: review.data?.customer_identity_questions ?? [], returns: review.data?.return_questions ?? [], payments: review.data?.payments ?? [], apply: applyPayment, dismiss: dismissPayment })] }),
     jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'On hold' }), jsx(Holds, { customers: holds.data?.customers ?? [], release })] }),
     jsxs('section', { children: [jsx('h2', { style: styles.h2, children: 'Activity' }), jsx(Activity, { events: events.data?.events ?? [] })] }),
     jsx('div', { style: styles.muted, children: 'The model writes the words; the ledger owns the numbers. Approving here binds your approval to the exact text; nothing is sent from this page.' }),

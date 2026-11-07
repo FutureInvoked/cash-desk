@@ -2,7 +2,7 @@ Předmět: Upomínka: {overdue_summary} ({total})
 
 Vážená paní, vážený pane,
 
-podle našich záznamů zůstává neuhrazeno:
+podle našich záznamů zůstává {cs_unpaid}:
 
 {invoice_lines}
 

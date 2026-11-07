@@ -21,6 +21,7 @@ from .chasing import (
 )
 from .dates import format_date, parse_date
 from .figure_lock import (
+    figure_status,
     Figures,
     LockResult,
     RevisionResult,
@@ -105,7 +106,7 @@ from .store import (
     bucket_for,
 )
 
-ENGINE_VERSION = "0.2.0"
+ENGINE_VERSION = "1.2.0"
 
 __all__ = [
     "ENGINE_VERSION",
@@ -127,7 +128,7 @@ __all__ = [
     "KINDS", "TemplateError", "DraftLine", "RenderContext", "load_template", "fill_template", "format_iban",
     "invoice_line", "payment_details", "stage_label", "render_draft",
     # figure lock
-    "Figures", "LockResult", "RevisionResult", "spelled_number", "iban_valid", "extract_figures", "unknown_figures", "broken_amounts",
+    "Figures", "LockResult", "RevisionResult", "spelled_number", "iban_valid", "figure_status", "extract_figures", "unknown_figures", "broken_amounts",
     "ledger_figures", "describe", "check", "revise",
     # approval
     "canonical_text", "draft_hash", "idempotency_key", "verify_hash", "with_hash",

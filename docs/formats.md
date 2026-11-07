@@ -1,0 +1,9 @@
+# What Cash Desk reads
+
+The full import behaviour, as summarised in the README.
+
+## Imports
+
+`cashdesk_import` reads a customers CSV, an invoice export (generic, Xero, QuickBooks or Stripe) or a bank statement. It reads what those exports really contain: Xero's amount due, amount credited, expected payment date (PlannedDate pauses chasing until two days after it), 'Not sent' flag (not chased) and its one-row-per-line-item layout, Stripe's amount remaining, QuickBooks report title and total rows, credit notes and credit memos (kept, never chased), bank files with separate debit/credit or direction columns and a status column (only booked lines count; a pending incoming line that names an invoice for exactly its open balance pauses that invoice's reminders for a week, never counted as cash). An exact DEBIT/CREDIT (DR/CR, Soll/Haben) in a Type or Transaction Type column signs an unsigned amount, and Sparkasse 'Umsatz vorgemerkt' in Info or Buchungsstatus is pending, not cash; other debit wording in a Type column of a statement with no negative amounts, or pending wording in a free-text Info column beside a possible receipt, refuses the file (a statement with any negative amount, or Debit/Credit or CdtDbtInd columns, keeps its descriptive Type values). Negative Debit/Credit values and conflicting amount, sign, currency or direction evidence are refused; they never become incoming cash. Day/month order is decided from the whole file; a file whose dates read both ways is refused until you say `dmy` or `mdy`. Imported settlements and local allocations are kept separately. A stale export cannot undo recorded payments; uncertain overlap pauses the invoice for human reconciliation. The same file is never imported twice.
+
+More detail per source (Xero, QuickBooks Online, Stripe, generic, bank statements) is in [cashdesk/README.md](../cashdesk/README.md).

@@ -59,7 +59,7 @@ def test_day_one_has_one_exact_match_and_one_fuzzy_candidate(files):
     assert len(result.review) == 1 and result.unmatched == () and result.credit_notes == ()
     (item,) = result.review
     assert item.kind == "MISSING" and item.candidates and item.candidates[0].invoice_number == "INV-2026-0044"
-    assert item.holds == (), "a near-miss candidate does not hold the invoice; the stage-28 draft still lists it"
+    assert set(item.holds) == {"INV-2026-0031", "INV-2026-0044"}, "known payer partial receipt protects both invoices"
 
 
 def run_demo() -> tuple[Store, dict]:
@@ -87,19 +87,18 @@ def test_day_one_plan_covers_every_stage_the_backlog_reminder_the_void_and_the_d
     store, out = run_demo()
     _, plan = out["bank_day1"]
     kinds = {d.customer_id: d.kind for d in plan.drafts}
-    assert kinds == {"C001": "stage07", "C002": "stage14", "C003": "stage21", "C004": "stage28", "C005": "stage28"}
+    assert kinds == {"C001": "stage07", "C002": "stage14", "C003": "stage21", "C005": "stage28"}
     assert {d.language for d in plan.drafts} == {"en"}
     stonebridge = next(d for d in plan.drafts if d.customer_id == "C005")
     assert plan.escalations == (), "Stonebridge is 36 days overdue on the first run: the customer is reminded first"
     assert stonebridge.subject == "Urgent: invoice INV-2026-0027 is 36 days overdue (EUR 12,100.00)" and "It is now 36 days past its due date" in stonebridge.body
     for d in plan.drafts:
         assert "earlier reminder" not in d.body and "Second reminder" not in d.subject, "nothing was ever sent, so no draft claims history"
-    assert {h.customer_id: h.reason for h in plan.held} == {"C006": "dispute"}
+    assert {h.customer_id: h.reason for h in plan.held} == {"C004": "payment_in_review", "C006": "dispute"}
     assert set(next(h for h in plan.held if h.customer_id == "C006").invoice_numbers) == {"INV-2026-0033", "INV-2026-0040"}
     assert plan.voided == ("INV-2026-0038",)
     assert [t.customer_id for t in plan.thanks] == ["C007"] and plan.thanks[0].language == "en" and "EUR 1,980.00" in plan.thanks[0].subject
-    birchfield = next(d for d in plan.drafts if d.customer_id == "C004")
-    assert birchfield.invoice_numbers == ("INV-2026-0031", "INV-2026-0044")
+    assert set(next(h for h in plan.held if h.customer_id == "C004").invoice_numbers) == {"INV-2026-0031", "INV-2026-0044"}
     bluebell = next(d for d in plan.drafts if d.customer_id == "C002")
     assert bluebell.invoice_numbers == ("INV-2026-0042",) and "EUR 1,250.00" in bluebell.subject
     assert store.get_invoice("INV-2026-0042").balance == D("1250.00")
@@ -137,10 +136,10 @@ def test_store_refuses_the_same_bank_day_twice_and_the_brief_reads_it_all():
     with pytest.raises(DuplicateImportError):
         store.ingest(read_bank_csv(DEMO / "bank_day1.csv"))
     snap = store.status_snapshot(DEMO_DATE)
-    assert snap.awaiting_approval == 7, "five reminders, two thank-yous"
+    assert snap.awaiting_approval == 6, "four reminders, two thank-yous; Birchfield paused for receipt review"
     assert snap.on_hold == 1 and snap.open_count == 8, "eleven invoices, one void, two paid"
     brief = morning_brief(store, DEMO_DATE, "en")
     assert "INV-2026-0045 Fernhill Test Media Ltd: EUR 1,980.00" in brief and "INV-2026-0043 Lindenway Logistics Ltd: EUR 3,025.00" in brief
     assert "Total per currency: EUR 5,005.00" in brief
     assert "Oakridge Placeholder Partners LLP (INV-2026-0033 disputed)" in brief
-    assert "## Awaiting approval (7)" in brief
+    assert "## Awaiting approval (6)" in brief

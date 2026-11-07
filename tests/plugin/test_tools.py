@@ -203,9 +203,13 @@ def test_slash_command_status_queue_and_help(plugin):
     ctx.call("cashdesk_draft", as_of=AS_OF)
     assert "awaiting approval" in ctx.command("status")
     queue = ctx.command("queue")
-    assert "waiting for approval" in queue and "hash" in queue
-    assert "  Reminder 14 · Bluebell Design Studio Ltd · " in queue and "    id bluebell-reminder14-0042-nov10" in queue
-    assert ctx.command("frobnicate") == module.COMMAND_HELP
+    assert "waiting for approval" in queue and "/cashdesk show" in queue
+    assert "  Reminder 14 · Bluebell Design Studio Ltd · " in queue and "    /cashdesk show bluebell-reminder14-0042-nov10" in queue
+    assert ctx.command("frobnicate").startswith("Unknown command 'frobnicate'") and module.HELP_TEXT in ctx.command("frobnicate")
+    help_text = ctx.command("help")
+    assert help_text == module.HELP_TEXT
+    for verb in ("still-open", "not-duplicate", "import-errors", "overlaps", "returns", "settlements", "surpluses", "identities", "bank-evidence", "approve", "review"):
+        assert verb in help_text, verb
     assert ctx.command("approve").startswith("Usage")
     draft = demo_stage14(ctx)
     assert ctx.command(f"approve {draft['id']} ffffffffffff").startswith("Refused")
@@ -223,7 +227,7 @@ def test_gate_blocks_writes_in_cron_and_escalates_sends(plugin):
     assert ctx.gate("cashdesk_queue") is None
     assert ctx.gate("cashdesk_import", {"kind": "bank", "path": "x.csv"}) is None
     verdict = ctx.gate("cashdesk_send", {"draft_id": "D-1", "draft_hash": "abc123"})
-    assert verdict["action"] == "approve" and verdict["rule_key"] == "cashdesk:send:abc123"
+    assert verdict["action"] == "block" and "Cash Desk will not send D-1" in verdict["message"]  # no such draft: never asked
     assert ctx.gate("cashdesk_send", {"draft_id": "D-1"})["action"] == "block"
     ctx.cron = object()
     for tool in sorted(module.WRITE_TOOLS):
@@ -363,7 +367,7 @@ def test_one_version_everywhere():
 
     version = manifest()["version"]
     newest = _re.search(r"^## (\d+\.\d+\.\d+)", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), _re.M).group(1)
-    assert version == newest == "1.1.0", (version, newest)
+    assert version == newest == "1.2.0", (version, newest)
     draft = ROOT / "docs" / "catalog-entry.draft.yaml"
     if draft.exists():
         catalog = yaml.safe_load(draft.read_text(encoding="utf-8"))
@@ -382,7 +386,9 @@ def test_one_currency_setting_for_the_demo_and_for_files_without_a_currency(plug
     assert "USD 1,250.00" in demo_stage14(ctx)["subject"]
     data = hermes_fakes / "plugin-data" / "cash-desk"
     (data / "bank.csv").write_text("id,date,amount,counterparty,reference\nX-1,2026-11-09,15.00,SOMEONE,thanks\n", encoding="utf-8")
-    assert ctx.call("cashdesk_import", kind="bank", path=str(data / "bank.csv"))["ok"]
+    refused = ctx.call("cashdesk_import", kind="bank", path=str(data / "bank.csv"))
+    assert refused["ok"] is False and "will not assume the account is in USD" in refused["error"]
+    assert ctx.call("cashdesk_import", kind="bank", path=str(data / "bank.csv"), default_currency="USD")["ok"]
     assert {p["currency"] for p in ctx.call("cashdesk_match", as_of=AS_OF)["unmatched"] for p in [p["payment"]]} == {"USD"}
 
 
@@ -404,4 +410,4 @@ def test_the_demo_always_happens_today(plugin, monkeypatch):
     northgate = next(d for d in ctx.call("cashdesk_queue")["drafts"] if d["kind"] == "stage07")
     assert "INV-2026-0041 due 2026-11-13: EUR 980.00 (7 days overdue)" in northgate["body"], northgate["body"]
     assert northgate["id"].endswith("-nov20")
-    assert len(ctx.call("cashdesk_queue")["drafts"]) == 7
+    assert len(ctx.call("cashdesk_queue")["drafts"]) == 6

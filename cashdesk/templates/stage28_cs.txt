@@ -2,7 +2,7 @@ Předmět: Naléhavé: {overdue_summary} ({total})
 
 Vážená paní, vážený pane,
 
-podle našich záznamů stále zůstává neuhrazeno:
+podle našich záznamů stále zůstává {cs_unpaid}:
 
 {invoice_lines}
 

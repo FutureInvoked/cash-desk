@@ -60,6 +60,8 @@ class DraftLine:
     days_overdue: int = 0
     reference: str = ""
     iban: str = ""
+    part_paid: bool = False  # part of the invoice is already paid: "not fully paid", never "not received"
+    still_open: Decimal = Decimal("0")  # thank-you notes: what remains open on the invoice after this payment
 
 
 @dataclass(frozen=True)
@@ -273,12 +275,23 @@ def render_draft(kind: str, lang: str, context: RenderContext) -> Draft:
         "greeting_dear": f"Dear {first_name}," if first_name else "Hello,",
         "history": _by_history(HISTORY, lang, sent),
         "reminder_lead": _by_history(REMINDER_LEAD, lang, sent),
+        # After a part payment the customer may just have had a thank-you: never say "not received".
+        "payment_word": "full payment" if any(l.part_paid for l in lines) else "payment",
+        "unpaid_word": "not fully paid" if any(l.part_paid for l in lines) else "unpaid",
+        "cs_full": "plnou " if any(l.part_paid for l in lines) else "",
+        "cs_unpaid": "uhrazeno jen zčásti" if any(l.part_paid for l in lines) else "neuhrazeno",
+        "still_open": "".join(
+            (f"\nNa faktuře {l.number} zbývá uhradit {format_money(l.still_open, l.currency, lang)}." if lang == "cs" else
+             f"\n{l.number}: {format_money(l.still_open, l.currency, lang)} is still open.")
+            for l in lines if l.still_open > 0),
     }
     subject_line, _, body_template = template.partition("\n")
     subject = fill_template(_SUBJECT_PREFIX.sub("", subject_line.strip()), mapping).strip()
     body = fill_template(body_template, mapping)
     body = re.sub(r"\n{3,}", "\n\n", body).strip("\n") + "\n"
-    recipients: tuple[str, ...] = () if kind in INTERNAL_KINDS else ((customer.email,) if customer.email else ())
+    # One contact cell may hold several addresses ("a@x; b@x", as QuickBooks exports them).
+    recipients: tuple[str, ...] = () if kind in INTERNAL_KINDS else tuple(
+        dict.fromkeys(a.strip() for a in re.split(r"[;,]", customer.email or "") if a.strip()))
     numbers = tuple(l.number for l in lines)
     draft = Draft(
         id=context.draft_id or _draft_id(kind, customer.id, context.as_of, numbers, customer.name),
